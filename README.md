@@ -1,4 +1,4 @@
-# openoperator-start-kit
+# openoperator 42
 
 赛事官网->https://openoperator.cn
 
