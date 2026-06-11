@@ -1,0 +1,121 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "bangc_scalar.h"
+
+__mlu_entry__ void conv_transposed_2d_square_kernel(
+    float *x,
+    float *weight,
+    float *bias,
+    float *output,
+    int batch,
+    int in_channels,
+    int h_in,
+    int w_in,
+    int out_channels,
+    int kernel_size,
+    int h_out,
+    int w_out,
+    int stride,
+    int padding,
+    int groups,
+    int has_bias) {
+    if (taskId != 0) {
+        return;
+    }
+
+    int output_total = batch * out_channels * h_out * w_out;
+    for (int i = 0; i < output_total; ++i) {
+        int oc = (i / (h_out * w_out)) % out_channels;
+        store_float(output + i, has_bias ? load_float(bias + oc) : 0.0f);
+    }
+
+    int in_per_group = in_channels / groups;
+    int out_per_group = out_channels / groups;
+    for (int b = 0; b < batch; ++b) {
+        for (int ic = 0; ic < in_channels; ++ic) {
+            int group = ic / in_per_group;
+            for (int ih = 0; ih < h_in; ++ih) {
+                for (int iw = 0; iw < w_in; ++iw) {
+                    float input_value =
+                        load_float(x + ((b * in_channels + ic) * h_in + ih) * w_in + iw);
+                    for (int ocg = 0; ocg < out_per_group; ++ocg) {
+                        int oc = group * out_per_group + ocg;
+                        for (int kh = 0; kh < kernel_size; ++kh) {
+                            int oh = ih * stride - padding + kh;
+                            if (oh < 0 || oh >= h_out) {
+                                continue;
+                            }
+                            for (int kw = 0; kw < kernel_size; ++kw) {
+                                int ow = iw * stride - padding + kw;
+                                if (ow < 0 || ow >= w_out) {
+                                    continue;
+                                }
+                                int out_offset =
+                                    ((b * out_channels + oc) * h_out + oh) * w_out + ow;
+                                float updated =
+                                    load_float(output + out_offset) +
+                                    input_value *
+                                        load_float(weight +
+                                                   ((ic * out_per_group + ocg) * kernel_size +
+                                                    kh) *
+                                                       kernel_size +
+                                                   kw);
+                                store_float(output + out_offset, updated);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride,
+    int padding,
+    int output_padding,
+    int groups) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+
+    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
+    torch::Tensor w_fp32 = weight.scalar_type() == torch::kFloat ? weight : weight.to(torch::kFloat);
+    torch::Tensor b_fp32 = bias;
+    int has_bias = bias.defined() && bias.numel() > 0;
+    if (has_bias && bias.scalar_type() != torch::kFloat) {
+        b_fp32 = bias.to(torch::kFloat);
+    }
+    auto dummy_bias = torch::empty({1}, x_fp32.options());
+
+    int64_t kernel_size = weight.size(2);
+    int64_t out_channels = weight.size(1) * groups;
+    int64_t h_out = (x.size(2) - 1) * stride - 2 * padding + kernel_size + output_padding;
+    int64_t w_out = (x.size(3) - 1) * stride - 2 * padding + kernel_size + output_padding;
+    auto output = torch::empty({x.size(0), out_channels, h_out, w_out}, x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    conv_transposed_2d_square_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        w_fp32.data_ptr<float>(),
+        has_bias ? b_fp32.data_ptr<float>() : dummy_bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        x_fp32.size(0),
+        x_fp32.size(1),
+        x_fp32.size(2),
+        x_fp32.size(3),
+        out_channels,
+        kernel_size,
+        h_out,
+        w_out,
+        stride,
+        padding,
+        groups,
+        has_bias);
+    return output;
+}

@@ -1,0 +1,54 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "bangc_scalar.h"
+
+__mlu_entry__ void scatter_add_kernel(
+    float *src,
+    int64_t *index,
+    float *output,
+    int N,
+    int D,
+    int dim_size) {
+    if (taskId != 0) {
+        return;
+    }
+
+    for (int i = 0; i < dim_size * D; ++i) {
+        store_float(output + i, 0.0f);
+    }
+    for (int n = 0; n < N; ++n) {
+        int64_t dst = load_int64(index + n);
+        if (dst < 0 || dst >= dim_size) {
+            continue;
+        }
+        for (int d = 0; d < D; ++d) {
+            int out_offset = dst * D + d;
+            float value = load_float(output + out_offset) + load_float(src + n * D + d);
+            store_float(output + out_offset, value);
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
+    TORCH_CHECK(src.is_contiguous(), "src must be contiguous");
+    TORCH_CHECK(index.is_contiguous(), "index must be contiguous");
+    TORCH_CHECK(src.dim() == 2, "src must be a 2D tensor");
+    TORCH_CHECK(index.numel() == src.size(0), "index length must match src first dimension");
+
+    torch::Tensor src_fp32 = src.scalar_type() == torch::kFloat ? src : src.to(torch::kFloat);
+    torch::Tensor index_i64 = index.scalar_type() == torch::kLong ? index : index.to(torch::kLong);
+    auto output = torch::empty({dim_size, src.size(1)}, src_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    scatter_add_kernel<<<dim, ktype, queue>>>(
+        src_fp32.data_ptr<float>(),
+        index_i64.data_ptr<int64_t>(),
+        output.data_ptr<float>(),
+        src_fp32.size(0),
+        src_fp32.size(1),
+        dim_size);
+    return output;
+}

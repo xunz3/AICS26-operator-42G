@@ -1,0 +1,49 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "bangc_scalar.h"
+
+__mlu_entry__ void masked_select_kernel(
+    float *input,
+    float *output,
+    int64_t *count,
+    int total,
+    float threshold) {
+    if (taskId != 0) {
+        return;
+    }
+
+    int64_t out_pos = 0;
+    for (int i = 0; i < total; ++i) {
+        float value = load_float(input + i);
+        if (value > threshold) {
+            store_float(output + out_pos, value);
+            ++out_pos;
+        }
+    }
+    store_int64(count, out_pos);
+}
+
+torch::Tensor bang_func(torch::Tensor input, double threshold) {
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+
+    torch::Tensor input_fp32 = input.scalar_type() == torch::kFloat
+                                   ? input
+                                   : input.to(torch::kFloat);
+    auto output = torch::empty({input_fp32.numel()}, input_fp32.options());
+    auto count = torch::empty({1}, input.options().dtype(torch::kLong));
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    masked_select_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output.data_ptr<float>(),
+        count.data_ptr<int64_t>(),
+        input_fp32.numel(),
+        static_cast<float>(threshold));
+
+    auto count_cpu = count.to(torch::kCPU);
+    int64_t valid = count_cpu.data_ptr<int64_t>()[0];
+    return output.narrow(0, 0, valid);
+}

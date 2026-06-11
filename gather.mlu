@@ -1,0 +1,79 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "bangc_scalar.h"
+
+__mlu_entry__ void gather_kernel(
+    float *x,
+    int64_t *indices,
+    float *weights,
+    float *output,
+    int tokens,
+    int hidden_size,
+    int num_elements,
+    int top_k,
+    int has_weights) {
+    int total_rows = tokens * top_k;
+    int total = total_rows * hidden_size;
+    int core_id = taskId;
+    int core_num = taskDim;
+
+    for (int idx = core_id; idx < total; idx += core_num) {
+        int hidden = idx % hidden_size;
+        int row = idx / hidden_size;
+        if (row >= num_elements) {
+            store_float(output + idx, 0.0f);
+            continue;
+        }
+        int64_t src_row = load_int64(indices + row);
+        if (src_row < 0 || src_row >= tokens) {
+            store_float(output + idx, 0.0f);
+            continue;
+        }
+        float value = load_float(x + src_row * hidden_size + hidden);
+        if (has_weights) {
+            value *= load_float(weights + row);
+        }
+        store_float(output + idx, value);
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor indices,
+    torch::Tensor bin_ids,
+    torch::Tensor weights,
+    torch::Tensor bins,
+    int top_k) {
+    (void)bin_ids;
+    (void)bins;
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "x must be [tokens, hidden_size]");
+
+    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
+    torch::Tensor idx_i64 = indices.scalar_type() == torch::kLong ? indices : indices.to(torch::kLong);
+    torch::Tensor w_fp32 = weights;
+    int has_weights = weights.defined() && weights.numel() == indices.numel();
+    if (has_weights && weights.scalar_type() != torch::kFloat) {
+        w_fp32 = weights.to(torch::kFloat);
+    }
+    auto dummy_weight = torch::empty({1}, x_fp32.options());
+
+    auto output = torch::empty({x.size(0) * top_k, x.size(1)}, x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    gather_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        idx_i64.data_ptr<int64_t>(),
+        has_weights ? w_fp32.data_ptr<float>() : dummy_weight.data_ptr<float>(),
+        output.data_ptr<float>(),
+        x_fp32.size(0),
+        x_fp32.size(1),
+        idx_i64.numel(),
+        top_k,
+        has_weights);
+    return output;
+}

@@ -1,0 +1,73 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "bangc_scalar.h"
+
+__mlu_entry__ void logsoftmax_kernel(
+    float *x,
+    float *output,
+    int rows,
+    int cols,
+    int dim) {
+    int core_id = taskId;
+    int core_num = taskDim;
+
+    if (dim == 1 || dim == -1) {
+        for (int row = core_id; row < rows; row += core_num) {
+            float max_value = load_float(x + row * cols);
+            for (int c = 1; c < cols; ++c) {
+                float value = load_float(x + row * cols + c);
+                if (value > max_value) {
+                    max_value = value;
+                }
+            }
+            float sum = 0.0f;
+            for (int c = 0; c < cols; ++c) {
+                sum += scalar_exp(load_float(x + row * cols + c) - max_value);
+            }
+            float log_sum = scalar_log(sum);
+            for (int c = 0; c < cols; ++c) {
+                store_float(output + row * cols + c,
+                            load_float(x + row * cols + c) - max_value - log_sum);
+            }
+        }
+    } else {
+        for (int col = core_id; col < cols; col += core_num) {
+            float max_value = load_float(x + col);
+            for (int r = 1; r < rows; ++r) {
+                float value = load_float(x + r * cols + col);
+                if (value > max_value) {
+                    max_value = value;
+                }
+            }
+            float sum = 0.0f;
+            for (int r = 0; r < rows; ++r) {
+                sum += scalar_exp(load_float(x + r * cols + col) - max_value);
+            }
+            float log_sum = scalar_log(sum);
+            for (int r = 0; r < rows; ++r) {
+                store_float(output + r * cols + col,
+                            load_float(x + r * cols + col) - max_value - log_sum);
+            }
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "x must be [batch_size, dim]");
+
+    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
+    auto output = torch::empty_like(x_fp32);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t kdim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    logsoftmax_kernel<<<kdim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output.data_ptr<float>(),
+        x_fp32.size(0),
+        x_fp32.size(1),
+        dim);
+    return output;
+}

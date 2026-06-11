@@ -1,0 +1,94 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "bangc_scalar.h"
+
+__mlu_entry__ void conv_standard_1d_kernel(
+    float *x,
+    float *weight,
+    float *bias,
+    float *output,
+    int batch,
+    int in_channels,
+    int length,
+    int out_channels,
+    int kernel_size,
+    int out_length,
+    int stride,
+    int padding,
+    int dilation,
+    int groups,
+    int has_bias) {
+    int total = batch * out_channels * out_length;
+    int core_id = taskId;
+    int core_num = taskDim;
+    int in_per_group = in_channels / groups;
+    int out_per_group = out_channels / groups;
+
+    for (int idx = core_id; idx < total; idx += core_num) {
+        int ol = idx % out_length;
+        int oc = (idx / out_length) % out_channels;
+        int b = idx / (out_channels * out_length);
+        int group = oc / out_per_group;
+        int ic_start = group * in_per_group;
+        float sum = has_bias ? load_float(bias + oc) : 0.0f;
+
+        for (int icg = 0; icg < in_per_group; ++icg) {
+            int ic = ic_start + icg;
+            for (int k = 0; k < kernel_size; ++k) {
+                int il = ol * stride - padding + k * dilation;
+                if (il >= 0 && il < length) {
+                    sum += load_float(x + (b * in_channels + ic) * length + il) *
+                           load_float(weight + (oc * in_per_group + icg) * kernel_size + k);
+                }
+            }
+        }
+        store_float(output + idx, sum);
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride,
+    int padding,
+    int dilation,
+    int groups) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(x.dim() == 3 && weight.dim() == 3, "invalid conv1d shapes");
+
+    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
+    torch::Tensor w_fp32 = weight.scalar_type() == torch::kFloat ? weight : weight.to(torch::kFloat);
+    torch::Tensor b_fp32 = bias;
+    int has_bias = bias.defined() && bias.numel() > 0;
+    if (has_bias && bias.scalar_type() != torch::kFloat) {
+        b_fp32 = bias.to(torch::kFloat);
+    }
+    auto dummy_bias = torch::empty({1}, x_fp32.options());
+
+    int64_t out_length = (x.size(2) + 2 * padding - dilation * (weight.size(2) - 1) - 1) / stride + 1;
+    auto output = torch::empty({x.size(0), weight.size(0), out_length}, x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    conv_standard_1d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        w_fp32.data_ptr<float>(),
+        has_bias ? b_fp32.data_ptr<float>() : dummy_bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        x_fp32.size(0),
+        x_fp32.size(1),
+        x_fp32.size(2),
+        w_fp32.size(0),
+        w_fp32.size(2),
+        out_length,
+        stride,
+        padding,
+        dilation,
+        groups,
+        has_bias);
+    return output;
+}

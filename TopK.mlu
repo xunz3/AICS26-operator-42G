@@ -1,0 +1,91 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <vector>
+#include "bangc_scalar.h"
+
+__mlu_entry__ void topk_kernel(
+    float *x,
+    float *values,
+    int64_t *indices,
+    int rows,
+    int cols,
+    int k,
+    int dim) {
+    int core_id = taskId;
+    int core_num = taskDim;
+
+    if (dim == 1 || dim == -1) {
+        for (int row = core_id; row < rows; row += core_num) {
+            for (int out = 0; out < k; ++out) {
+                float best = -3.402823466e+38f;
+                int64_t best_idx = 0;
+                for (int c = 0; c < cols; ++c) {
+                    float value = load_float(x + row * cols + c);
+                    bool used = false;
+                    for (int prev = 0; prev < out; ++prev) {
+                        if (load_int64(indices + row * k + prev) == c) {
+                            used = true;
+                        }
+                    }
+                    if (!used && value > best) {
+                        best = value;
+                        best_idx = c;
+                    }
+                }
+                store_float(values + row * k + out, best);
+                store_int64(indices + row * k + out, best_idx);
+            }
+        }
+    } else {
+        for (int col = core_id; col < cols; col += core_num) {
+            for (int out = 0; out < k; ++out) {
+                float best = -3.402823466e+38f;
+                int64_t best_idx = 0;
+                for (int r = 0; r < rows; ++r) {
+                    float value = load_float(x + r * cols + col);
+                    bool used = false;
+                    for (int prev = 0; prev < out; ++prev) {
+                        if (load_int64(indices + prev * cols + col) == r) {
+                            used = true;
+                        }
+                    }
+                    if (!used && value > best) {
+                        best = value;
+                        best_idx = r;
+                    }
+                }
+                store_float(values + out * cols + col, best);
+                store_int64(indices + out * cols + col, best_idx);
+            }
+        }
+    }
+}
+
+std::vector<torch::Tensor> bang_func(torch::Tensor x, int k, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "x must be [batch, dim]");
+
+    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
+    std::vector<int64_t> out_shape;
+    if (dim == 0) {
+        out_shape = {k, x.size(1)};
+    } else {
+        out_shape = {x.size(0), k};
+    }
+    auto values = torch::empty(out_shape, x_fp32.options());
+    auto indices = torch::empty(out_shape, x.options().dtype(torch::kLong));
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t kdim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    topk_kernel<<<kdim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        values.data_ptr<float>(),
+        indices.data_ptr<int64_t>(),
+        x_fp32.size(0),
+        x_fp32.size(1),
+        k,
+        dim);
+    return {values, indices};
+}

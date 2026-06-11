@@ -1,0 +1,68 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <vector>
+#include "bangc_scalar.h"
+
+__mlu_entry__ void argmax_over_a_dimension_kernel(
+    float *x,
+    int64_t *output,
+    int outer,
+    int dim_size,
+    int inner) {
+    int total = outer * inner;
+    int core_id = taskId;
+    int core_num = taskDim;
+
+    for (int idx = core_id; idx < total; idx += core_num) {
+        int outer_idx = idx / inner;
+        int inner_idx = idx % inner;
+        float max_value = load_float(x + (outer_idx * dim_size) * inner + inner_idx);
+        int64_t max_index = 0;
+        for (int d = 1; d < dim_size; ++d) {
+            float value = load_float(x + (outer_idx * dim_size + d) * inner + inner_idx);
+            if (value > max_value) {
+                max_value = value;
+                max_index = d;
+            }
+        }
+        store_int64(output + idx, max_index);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    if (dim < 0) {
+        dim += x.dim();
+    }
+    TORCH_CHECK(dim >= 0 && dim < x.dim(), "dim out of range");
+
+    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
+    std::vector<int64_t> out_sizes;
+    for (int i = 0; i < x_fp32.dim(); ++i) {
+        if (i != dim) {
+            out_sizes.push_back(x_fp32.size(i));
+        }
+    }
+    auto output = torch::empty(out_sizes, x.options().dtype(torch::kLong));
+
+    int64_t outer = 1;
+    int64_t inner = 1;
+    for (int i = 0; i < dim; ++i) {
+        outer *= x_fp32.size(i);
+    }
+    for (int i = dim + 1; i < x_fp32.dim(); ++i) {
+        inner *= x_fp32.size(i);
+    }
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t kdim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    argmax_over_a_dimension_kernel<<<kdim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output.data_ptr<int64_t>(),
+        outer,
+        x_fp32.size(dim),
+        inner);
+    return output;
+}

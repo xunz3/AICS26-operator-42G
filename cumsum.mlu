@@ -1,0 +1,58 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <vector>
+#include "bangc_scalar.h"
+
+__mlu_entry__ void cumsum_kernel(
+    float *x,
+    float *output,
+    int outer,
+    int dim_size,
+    int inner) {
+    int total_lines = outer * inner;
+    int core_id = taskId;
+    int core_num = taskDim;
+
+    for (int line = core_id; line < total_lines; line += core_num) {
+        int outer_idx = line / inner;
+        int inner_idx = line % inner;
+        float sum = 0.0f;
+        for (int d = 0; d < dim_size; ++d) {
+            int offset = (outer_idx * dim_size + d) * inner + inner_idx;
+            sum += load_float(x + offset);
+            store_float(output + offset, sum);
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    if (dim < 0) {
+        dim += x.dim();
+    }
+    TORCH_CHECK(dim >= 0 && dim < x.dim(), "dim out of range");
+
+    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
+    auto output = torch::empty_like(x_fp32);
+
+    int64_t outer = 1;
+    int64_t inner = 1;
+    for (int i = 0; i < dim; ++i) {
+        outer *= x_fp32.size(i);
+    }
+    for (int i = dim + 1; i < x_fp32.dim(); ++i) {
+        inner *= x_fp32.size(i);
+    }
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t kdim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    cumsum_kernel<<<kdim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output.data_ptr<float>(),
+        outer,
+        x_fp32.size(dim),
+        inner);
+    return output;
+}
