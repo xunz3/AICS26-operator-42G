@@ -20,55 +20,52 @@ __mlu_entry__ void conv_transposed_2d_square_kernel(
     int padding,
     int groups,
     int has_bias) {
-    if (taskId != 0) {
-        return;
-    }
-
     int output_total = batch * out_channels * h_out * w_out;
-    for (int i = 0; i < output_total; ++i) {
-        int oc = (i / (h_out * w_out)) % out_channels;
-        __store_gdram(output + i,
-                      has_bias ? __load_gdram(bias + oc) : (half)0.0f);
-    }
-
+    int core_id = taskId;
+    int core_num = taskDim;
     int in_per_group = in_channels / groups;
     int out_per_group = out_channels / groups;
-    for (int b = 0; b < batch; ++b) {
-        for (int ic = 0; ic < in_channels; ++ic) {
-            int group = ic / in_per_group;
-            for (int ih = 0; ih < h_in; ++ih) {
-                for (int iw = 0; iw < w_in; ++iw) {
-                    float input_value =
-                        (float)__load_gdram(x + ((b * in_channels + ic) * h_in + ih) * w_in + iw);
-                    for (int ocg = 0; ocg < out_per_group; ++ocg) {
-                        int oc = group * out_per_group + ocg;
-                        for (int kh = 0; kh < kernel_size; ++kh) {
-                            int oh = ih * stride - padding + kh;
-                            if (oh < 0 || oh >= h_out) {
-                                continue;
-                            }
-                            for (int kw = 0; kw < kernel_size; ++kw) {
-                                int ow = iw * stride - padding + kw;
-                                if (ow < 0 || ow >= w_out) {
-                                    continue;
-                                }
-                                int out_offset =
-                                    ((b * out_channels + oc) * h_out + oh) * w_out + ow;
-                                float updated =
-                                    (float)__load_gdram(output + out_offset) +
-                                    input_value *
-                                        (float)__load_gdram(weight +
-                                                            ((ic * out_per_group + ocg) * kernel_size +
-                                                             kh) *
-                                                                kernel_size +
-                                                            kw);
-                                __store_gdram(output + out_offset, (half)updated);
-                            }
-                        }
+
+    for (int idx = core_id; idx < output_total; idx += core_num) {
+        int ow = idx % w_out;
+        int oh = (idx / w_out) % h_out;
+        int oc = (idx / (h_out * w_out)) % out_channels;
+        int b = idx / (out_channels * h_out * w_out);
+        int group = oc / out_per_group;
+        int ocg = oc - group * out_per_group;
+        int ic_start = group * in_per_group;
+        float sum = has_bias ? (float)__load_gdram(bias + oc) : 0.0f;
+
+        for (int icg = 0; icg < in_per_group; ++icg) {
+            int ic = ic_start + icg;
+            for (int kh = 0; kh < kernel_size; ++kh) {
+                int ih_unstrided = oh + padding - kh;
+                if (ih_unstrided < 0 || ih_unstrided % stride != 0) {
+                    continue;
+                }
+                int ih = ih_unstrided / stride;
+                if (ih < 0 || ih >= h_in) {
+                    continue;
+                }
+                for (int kw = 0; kw < kernel_size; ++kw) {
+                    int iw_unstrided = ow + padding - kw;
+                    if (iw_unstrided < 0 || iw_unstrided % stride != 0) {
+                        continue;
                     }
+                    int iw = iw_unstrided / stride;
+                    if (iw < 0 || iw >= w_in) {
+                        continue;
+                    }
+                    sum +=
+                        (float)__load_gdram(x + ((b * in_channels + ic) * h_in + ih) * w_in + iw) *
+                        (float)__load_gdram(weight +
+                                            ((ic * out_per_group + ocg) * kernel_size + kh) *
+                                                kernel_size +
+                                            kw);
                 }
             }
         }
+        __store_gdram(output + idx, (half)sum);
     }
 }
 
@@ -104,7 +101,7 @@ torch::Tensor bang_func(
     auto output = torch::empty({x.size(0), actual_out_channels, h_out, w_out}, x.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
+    cnrtDim3_t dim = {64, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     conv_transposed_2d_square_kernel<<<dim, ktype, queue>>>(
         (half *)x.data_ptr(),
