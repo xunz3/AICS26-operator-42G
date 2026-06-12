@@ -1,9 +1,7 @@
 #include <bang.h>
 #include <torch/extension.h>
-#include <ATen/ops/conv2d.h>
 #include <cnrt.h>
 #include <stdint.h>
-#include <optional>
 
 __mlu_entry__ void dilated_conv_2d_kernel(
     half *x,
@@ -70,12 +68,33 @@ torch::Tensor bang_func(
     (void)in_channels;
     (void)out_channels;
     (void)kernel_size;
-    return at::conv2d(
-        x,
-        kernel,
-        std::nullopt,
-        {1, 1},
-        {padding, padding},
-        {dilation, dilation},
-        1);
+    int stride = 1;
+    int actual_in_channels = x.size(1);
+    int actual_out_channels = kernel.size(0);
+    int actual_kernel_size = kernel.size(2);
+    int64_t out_h =
+        (x.size(2) + 2 * padding - dilation * (actual_kernel_size - 1) - 1) / stride + 1;
+    int64_t out_w =
+        (x.size(3) + 2 * padding - dilation * (actual_kernel_size - 1) - 1) / stride + 1;
+    auto output = torch::empty({x.size(0), actual_out_channels, out_h, out_w}, x.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    dilated_conv_2d_kernel<<<dim, ktype, queue>>>(
+        (half *)x.data_ptr(),
+        (half *)kernel.data_ptr(),
+        (half *)output.data_ptr(),
+        x.size(0),
+        actual_in_channels,
+        x.size(2),
+        x.size(3),
+        actual_out_channels,
+        actual_kernel_size,
+        stride,
+        dilation,
+        padding,
+        out_h,
+        out_w);
+    return output;
 }

@@ -1,10 +1,9 @@
 #include <bang.h>
 #include <torch/extension.h>
-#include <ATen/ops/bmm.h>
 #include <cnrt.h>
 #include <stdint.h>
 
-#define BMM_CHUNK_SIZE 1024
+#define BMM_N_BLOCK 16
 
 __mlu_entry__ void batched_matrix_multiplication_kernel(
     half *A,
@@ -14,39 +13,38 @@ __mlu_entry__ void batched_matrix_multiplication_kernel(
     int M,
     int K,
     int N) {
-    int total = batch * M * N;
+    int n_blocks = (N + BMM_N_BLOCK - 1) / BMM_N_BLOCK;
+    int total = batch * M * n_blocks;
     int core_id = taskId;
     int core_num = taskDim;
-    __nram__ half nram_a[BMM_CHUNK_SIZE];
-    __nram__ half nram_b[BMM_CHUNK_SIZE];
-    __nram__ float nram_a_f[BMM_CHUNK_SIZE];
-    __nram__ float nram_b_f[BMM_CHUNK_SIZE];
-    __nram__ float nram_prod[BMM_CHUNK_SIZE];
 
     for (int idx = core_id; idx < total; idx += core_num) {
-        int n = idx % N;
-        int m = (idx / N) % M;
-        int b = idx / (M * N);
-        float sum = 0.0f;
-        int k = 0;
-        for (; k + BMM_CHUNK_SIZE <= K; k += BMM_CHUNK_SIZE) {
-            __memcpy(nram_a, A + (b * M + m) * K + k,
-                     BMM_CHUNK_SIZE * sizeof(half), GDRAM2NRAM);
-            for (int kk = 0; kk < BMM_CHUNK_SIZE; ++kk) {
-                nram_b[kk] = __load_gdram(B + (b * K + k + kk) * N + n);
-            }
-            __bang_half2float(nram_a_f, nram_a, BMM_CHUNK_SIZE);
-            __bang_half2float(nram_b_f, nram_b, BMM_CHUNK_SIZE);
-            __bang_mul(nram_prod, nram_a_f, nram_b_f, BMM_CHUNK_SIZE);
-            for (int kk = 0; kk < BMM_CHUNK_SIZE; ++kk) {
-                sum += nram_prod[kk];
+        int nb = idx % n_blocks;
+        int m = (idx / n_blocks) % M;
+        int b = idx / (M * n_blocks);
+        int n_base = nb * BMM_N_BLOCK;
+        float sums[BMM_N_BLOCK];
+        for (int n = 0; n < BMM_N_BLOCK; ++n) {
+            sums[n] = 0.0f;
+        }
+
+        for (int k = 0; k < K; ++k) {
+            float a_value = (float)__load_gdram(A + (b * M + m) * K + k);
+            for (int n = 0; n < BMM_N_BLOCK; ++n) {
+                int col = n_base + n;
+                if (col < N) {
+                    sums[n] +=
+                        a_value *
+                        (float)__load_gdram(B + (b * K + k) * N + col);
+                }
             }
         }
-        for (; k < K; ++k) {
-            sum += (float)__load_gdram(A + (b * M + m) * K + k) *
-                   (float)__load_gdram(B + (b * K + k) * N + n);
+        for (int n = 0; n < BMM_N_BLOCK; ++n) {
+            int col = n_base + n;
+            if (col < N) {
+                __store_gdram(output + (b * M + m) * N + col, (half)sums[n]);
+            }
         }
-        __store_gdram(output + idx, (half)sum);
     }
 }
 
@@ -58,5 +56,18 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.scalar_type() == torch::kHalf && B.scalar_type() == torch::kHalf,
                 "A and B must be float16");
 
-    return at::bmm(A, B);
+    auto output = torch::empty({A.size(0), A.size(1), B.size(2)}, A.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {16, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    batched_matrix_multiplication_kernel<<<dim, ktype, queue>>>(
+        (half *)A.data_ptr(),
+        (half *)B.data_ptr(),
+        (half *)output.data_ptr(),
+        A.size(0),
+        A.size(1),
+        A.size(2),
+        B.size(2));
+    return output;
 }

@@ -3,8 +3,8 @@
 #include <cnrt.h>
 #include <stdint.h>
 
-#ifndef AICS_BANGC_SCALAR_HELPERS
-#define AICS_BANGC_SCALAR_HELPERS
+#ifndef AICS_BANGC_GRU_HELPERS
+#define AICS_BANGC_GRU_HELPERS
 
 __nram__ float scalar_f_buffer[1];
 
@@ -25,66 +25,170 @@ __mlu_func__ float scalar_tanh(float value) {
 
 #endif
 
+__mlu_func__ float load_layer_input(
+    half *x,
+    half *output,
+    int layer,
+    int b,
+    int t,
+    int j,
+    int batch,
+    int seq_len,
+    int input_size,
+    int hidden_size) {
+    (void)batch;
+    if (layer == 0) {
+        return (float)__load_gdram(x + (b * seq_len + t) * input_size + j);
+    }
+    return (float)__load_gdram(output + (b * seq_len + t) * hidden_size + j);
+}
+
+__mlu_func__ float load_prev_hidden(
+    half *output,
+    int b,
+    int t,
+    int j,
+    int seq_len,
+    int hidden_size) {
+    if (t <= 0) {
+        return 0.0f;
+    }
+    return (float)__load_gdram(output + (b * seq_len + (t - 1)) * hidden_size + j);
+}
+
 __mlu_entry__ void gru_forward_kernel(
     half *x,
+    half *w_ih0,
+    half *w_hh0,
+    half *b_ih0,
+    half *b_hh0,
+    half *w_ih1,
+    half *w_hh1,
+    half *b_ih1,
+    half *b_hh1,
     half *output,
     int batch,
     int seq_len,
     int input_size,
     int hidden_size,
-    int num_layers) {
+    int num_layers,
+    int has_bias0,
+    int has_bias1) {
     if (taskId != 0) {
         return;
     }
 
     for (int layer = 0; layer < num_layers; ++layer) {
         int layer_input_size = layer == 0 ? input_size : hidden_size;
+        half *w_ih = layer == 0 ? w_ih0 : w_ih1;
+        half *w_hh = layer == 0 ? w_hh0 : w_hh1;
+        half *b_ih = layer == 0 ? b_ih0 : b_ih1;
+        half *b_hh = layer == 0 ? b_hh0 : b_hh1;
+        int has_bias = layer == 0 ? has_bias0 : has_bias1;
+
         for (int b = 0; b < batch; ++b) {
             for (int t = 0; t < seq_len; ++t) {
                 for (int h = 0; h < hidden_size; ++h) {
-                    float xt = 0.0f;
-                    if (h < layer_input_size) {
-                        if (layer == 0) {
-                            xt = (float)__load_gdram(x + (b * seq_len + t) * input_size + h);
-                        } else {
-                            xt = (float)__load_gdram(output + (b * seq_len + t) * hidden_size + h);
-                        }
+                    float gate_r = 0.0f;
+                    float gate_z = 0.0f;
+                    float gate_n_i = 0.0f;
+                    float gate_n_h = 0.0f;
+                    if (has_bias) {
+                        gate_r += (float)__load_gdram(b_ih + h) +
+                                  (float)__load_gdram(b_hh + h);
+                        gate_z += (float)__load_gdram(b_ih + hidden_size + h) +
+                                  (float)__load_gdram(b_hh + hidden_size + h);
+                        gate_n_i += (float)__load_gdram(b_ih + 2 * hidden_size + h);
+                        gate_n_h += (float)__load_gdram(b_hh + 2 * hidden_size + h);
                     }
 
-                    float h_prev = 0.0f;
-                    if (t > 0) {
-                        h_prev = (float)__load_gdram(output + (b * seq_len + (t - 1)) * hidden_size + h);
+                    for (int j = 0; j < layer_input_size; ++j) {
+                        float in_value = load_layer_input(
+                            x, output, layer, b, t, j, batch, seq_len, input_size, hidden_size);
+                        gate_r += in_value *
+                                  (float)__load_gdram(w_ih + h * layer_input_size + j);
+                        gate_z += in_value *
+                                  (float)__load_gdram(w_ih + (hidden_size + h) * layer_input_size + j);
+                        gate_n_i += in_value *
+                                    (float)__load_gdram(w_ih + (2 * hidden_size + h) *
+                                                            layer_input_size +
+                                                        j);
                     }
 
-                    float z = scalar_sigmoid(xt);
-                    float r = scalar_sigmoid(xt + h_prev);
-                    float n = scalar_tanh(xt + r * h_prev);
-                    __store_gdram(output + (b * seq_len + t) * hidden_size + h,
-                                  (half)((1.0f - z) * n + z * h_prev));
+                    for (int j = 0; j < hidden_size; ++j) {
+                        float prev = load_prev_hidden(output, b, t, j, seq_len, hidden_size);
+                        gate_r += prev *
+                                  (float)__load_gdram(w_hh + h * hidden_size + j);
+                        gate_z += prev *
+                                  (float)__load_gdram(w_hh + (hidden_size + h) * hidden_size + j);
+                        gate_n_h += prev *
+                                    (float)__load_gdram(w_hh + (2 * hidden_size + h) *
+                                                            hidden_size +
+                                                        j);
+                    }
+
+                    float h_prev = load_prev_hidden(output, b, t, h, seq_len, hidden_size);
+                    float r = scalar_sigmoid(gate_r);
+                    float z = scalar_sigmoid(gate_z);
+                    float n = scalar_tanh(gate_n_i + r * gate_n_h);
+                    float h_new = (1.0f - z) * n + z * h_prev;
+                    __store_gdram(output + (b * seq_len + t) * hidden_size + h, (half)h_new);
                 }
             }
         }
     }
 }
 
-torch::Tensor bang_func(torch::Tensor x, int input_size, int hidden_size, int num_layers) {
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor w_ih0,
+    torch::Tensor w_hh0,
+    torch::Tensor b_ih0,
+    torch::Tensor b_hh0,
+    torch::Tensor w_ih1,
+    torch::Tensor w_hh1,
+    torch::Tensor b_ih1,
+    torch::Tensor b_hh1,
+    int input_size,
+    int hidden_size,
+    int num_layers) {
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(w_ih0.is_contiguous() && w_hh0.is_contiguous(),
+                "layer 0 weights must be contiguous");
     TORCH_CHECK(x.dim() == 3, "GRU input must be [batch, seq_len, input_size]");
     TORCH_CHECK(x.size(2) == input_size, "input_size must match input feature dimension");
     TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
 
     auto output = torch::empty({x.size(0), x.size(1), hidden_size}, x.options());
+    auto dummy = torch::empty({1}, x.options());
+
+    int has_bias0 = b_ih0.defined() && b_hh0.defined() &&
+                    b_ih0.numel() >= 3 * hidden_size &&
+                    b_hh0.numel() >= 3 * hidden_size;
+    int has_bias1 = b_ih1.defined() && b_hh1.defined() &&
+                    b_ih1.numel() >= 3 * hidden_size &&
+                    b_hh1.numel() >= 3 * hidden_size;
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {1, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     gru_forward_kernel<<<dim, ktype, queue>>>(
         (half *)x.data_ptr(),
+        (half *)w_ih0.data_ptr(),
+        (half *)w_hh0.data_ptr(),
+        has_bias0 ? (half *)b_ih0.data_ptr() : (half *)dummy.data_ptr(),
+        has_bias0 ? (half *)b_hh0.data_ptr() : (half *)dummy.data_ptr(),
+        num_layers > 1 ? (half *)w_ih1.data_ptr() : (half *)dummy.data_ptr(),
+        num_layers > 1 ? (half *)w_hh1.data_ptr() : (half *)dummy.data_ptr(),
+        has_bias1 ? (half *)b_ih1.data_ptr() : (half *)dummy.data_ptr(),
+        has_bias1 ? (half *)b_hh1.data_ptr() : (half *)dummy.data_ptr(),
         (half *)output.data_ptr(),
         x.size(0),
         x.size(1),
         input_size,
         hidden_size,
-        num_layers);
+        num_layers,
+        has_bias0,
+        has_bias1);
     return output;
 }

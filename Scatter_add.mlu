@@ -1,9 +1,6 @@
 #include <bang.h>
 #include <torch/extension.h>
-#include <ATen/ops/index_add.h>
-#include <ATen/ops/zeros.h>
 #include <cnrt.h>
-#include <vector>
 #include <stdint.h>
 
 #ifndef AICS_BANGC_SCALAR_HELPERS
@@ -19,9 +16,9 @@ __mlu_func__ int64_t load_int64(int64_t *ptr) {
 #endif
 
 __mlu_entry__ void scatter_add_kernel(
-    float *src,
+    half *src,
     int64_t *index,
-    float *output,
+    half *output,
     int N,
     int D,
     int dim_size) {
@@ -30,7 +27,7 @@ __mlu_entry__ void scatter_add_kernel(
     }
 
     for (int i = 0; i < dim_size * D; ++i) {
-        __store_gdram(output + i, 0.0f);
+        __store_gdram(output + i, (half)0.0f);
     }
     for (int n = 0; n < N; ++n) {
         int64_t dst = load_int64(index + n);
@@ -39,9 +36,9 @@ __mlu_entry__ void scatter_add_kernel(
         }
         for (int d = 0; d < D; ++d) {
             int out_offset = dst * D + d;
-            float value = __load_gdram(output + out_offset) +
-                          __load_gdram(src + n * D + d);
-            __store_gdram(output + out_offset, value);
+            float value = (float)__load_gdram(output + out_offset) +
+                          (float)__load_gdram(src + n * D + d);
+            __store_gdram(output + out_offset, (half)value);
         }
     }
 }
@@ -51,15 +48,22 @@ torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
     TORCH_CHECK(index.is_contiguous(), "index must be contiguous");
     TORCH_CHECK(src.dim() == 1 || src.dim() == 2, "src must be a 1D or 2D tensor");
     TORCH_CHECK(index.numel() == src.size(0), "index length must match src first dimension");
+    TORCH_CHECK(src.scalar_type() == torch::kHalf, "src must be float16");
     torch::Tensor index_i64 = index.scalar_type() == torch::kLong ? index : index.to(torch::kLong);
-    index_i64 = index_i64.reshape({src.size(0)});
+    int64_t feature_dim = src.dim() == 1 ? 1 : src.size(1);
+    auto output = src.dim() == 1
+                      ? torch::empty({dim_size}, src.options())
+                      : torch::empty({dim_size, feature_dim}, src.options());
 
-    std::vector<int64_t> output_shape;
-    if (src.dim() == 1) {
-        output_shape = {dim_size};
-    } else {
-        output_shape = {dim_size, src.size(1)};
-    }
-    auto output = at::zeros(output_shape, src.options());
-    return at::index_add(output, 0, index_i64, src);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    scatter_add_kernel<<<dim, ktype, queue>>>(
+        (half *)src.data_ptr(),
+        index_i64.data_ptr<int64_t>(),
+        (half *)output.data_ptr(),
+        src.size(0),
+        feature_dim,
+        dim_size);
+    return output;
 }

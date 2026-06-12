@@ -1,9 +1,7 @@
 #include <bang.h>
 #include <torch/extension.h>
-#include <ATen/ops/conv_transpose2d.h>
 #include <cnrt.h>
 #include <stdint.h>
-#include <optional>
 
 __mlu_entry__ void conv_transposed_2d_square_kernel(
     half *x,
@@ -94,13 +92,34 @@ torch::Tensor bang_func(
     (void)kernel_size;
     (void)has_bias;
 
-    return at::conv_transpose2d(
-        x,
-        weight,
-        std::nullopt,
-        {stride, stride},
-        {padding, padding},
-        {output_padding, output_padding},
+    auto dummy_bias = torch::empty({1}, x.options());
+
+    int actual_in_channels = x.size(1);
+    int actual_kernel_size = weight.size(2);
+    int actual_out_channels = weight.size(1) * groups;
+    int64_t h_out = (x.size(2) - 1) * stride - 2 * padding + actual_kernel_size + output_padding;
+    int64_t w_out = (x.size(3) - 1) * stride - 2 * padding + actual_kernel_size + output_padding;
+    auto output = torch::empty({x.size(0), actual_out_channels, h_out, w_out}, x.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    conv_transposed_2d_square_kernel<<<dim, ktype, queue>>>(
+        (half *)x.data_ptr(),
+        (half *)weight.data_ptr(),
+        (half *)dummy_bias.data_ptr(),
+        (half *)output.data_ptr(),
+        x.size(0),
+        actual_in_channels,
+        x.size(2),
+        x.size(3),
+        actual_out_channels,
+        actual_kernel_size,
+        h_out,
+        w_out,
+        stride,
+        padding,
         groups,
-        {1, 1});
+        0);
+    return output;
 }
