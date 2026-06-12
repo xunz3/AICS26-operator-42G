@@ -97,12 +97,14 @@ torch::Tensor bang_func(
     int actual_in_channels = x.size(1);
     int actual_kernel_size = weight.size(2);
     int actual_out_channels = weight.size(1) * groups;
-    int64_t h_out = (x.size(2) - 1) * stride - 2 * padding + actual_kernel_size + output_padding;
-    int64_t w_out = (x.size(3) - 1) * stride - 2 * padding + actual_kernel_size + output_padding;
+    int h_out = static_cast<int>(
+        (x.size(2) - 1) * stride - 2 * padding + actual_kernel_size + output_padding);
+    int w_out = static_cast<int>(
+        (x.size(3) - 1) * stride - 2 * padding + actual_kernel_size + output_padding);
     auto output = torch::empty({x.size(0), actual_out_channels, h_out, w_out}, x.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {1, 1, 1};
+    cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     conv_transposed_2d_square_kernel<<<dim, ktype, queue>>>(
         (half *)x.data_ptr(),

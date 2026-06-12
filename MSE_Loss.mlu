@@ -6,7 +6,7 @@
 __mlu_entry__ void mse_loss_kernel(
     half *predictions,
     half *targets,
-    half *output,
+    float *output,
     int total) {
     if (taskId != 0) {
         return;
@@ -18,7 +18,7 @@ __mlu_entry__ void mse_loss_kernel(
                      (float)__load_gdram(targets + i);
         sum += diff * diff;
     }
-    __store_gdram(output, (half)(sum / (float)total));
+    __store_gdram(output, sum / (float)total);
 }
 
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
@@ -29,15 +29,15 @@ torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
                     targets.scalar_type() == torch::kHalf,
                 "predictions and targets must be float16");
 
-    auto output = torch::empty({}, predictions.options());
+    auto output = torch::empty({}, predictions.options().dtype(torch::kFloat));
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {1, 1, 1};
+    cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     mse_loss_kernel<<<dim, ktype, queue>>>(
         (half *)predictions.data_ptr(),
         (half *)targets.data_ptr(),
-        (half *)output.data_ptr(),
-        predictions.numel());
+        output.data_ptr<float>(),
+        static_cast<int>(predictions.numel()));
     return output;
 }

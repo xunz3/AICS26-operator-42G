@@ -16,10 +16,21 @@ __mlu_func__ float scalar_exp(float value) {
 }
 
 __mlu_func__ float scalar_sigmoid(float value) {
-    return 1.0f / (1.0f + scalar_exp(-value));
+    if (value >= 0.0f) {
+        float exp_neg = scalar_exp(-value);
+        return 1.0f / (1.0f + exp_neg);
+    }
+    float exp_pos = scalar_exp(value);
+    return exp_pos / (1.0f + exp_pos);
 }
 
 __mlu_func__ float scalar_tanh(float value) {
+    if (value > 10.0f) {
+        return 1.0f;
+    }
+    if (value < -10.0f) {
+        return -1.0f;
+    }
     return 2.0f / (1.0f + scalar_exp(-2.0f * value)) - 1.0f;
 }
 
@@ -170,7 +181,7 @@ torch::Tensor bang_func(
                     b_hh1.numel() >= 3 * hidden_size;
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {1, 1, 1};
+    cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     gru_forward_kernel<<<dim, ktype, queue>>>(
         (half *)x.data_ptr(),

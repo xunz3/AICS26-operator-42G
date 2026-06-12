@@ -48,7 +48,7 @@ __mlu_entry__ void gather_kernel(
             continue;
         }
 
-        int64_t src_row = flat_id < tokens ? flat_id : flat_id / top_k;
+        int64_t src_row = flat_id / top_k;
         if (src_row < 0 || src_row >= tokens) {
             __store_gdram(output + idx, (half)0.0f);
             continue;
@@ -57,7 +57,9 @@ __mlu_entry__ void gather_kernel(
         float value = (float)__load_gdram(x + src_row * hidden_size + hidden);
         if (has_weights) {
             int64_t weight_id = flat_id;
-            if (weights_num == indices_num) {
+            if (weights_num >= tokens * top_k) {
+                weight_id = flat_id;
+            } else if (weights_num == indices_num) {
                 weight_id = row;
             } else if (weights_num == tokens) {
                 weight_id = src_row;

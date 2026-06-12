@@ -20,7 +20,7 @@ __mlu_func__ float scalar_log(float value) {
 __mlu_entry__ void kl_divergence_loss_kernel(
     half *input_log_prob,
     half *target_prob,
-    half *output,
+    float *output,
     int batch,
     int total) {
     if (taskId != 0) {
@@ -35,7 +35,7 @@ __mlu_entry__ void kl_divergence_loss_kernel(
                              (float)__load_gdram(input_log_prob + i));
         }
     }
-    __store_gdram(output, (half)(sum / (float)batch));
+    __store_gdram(output, sum / (float)batch);
 }
 
 torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
@@ -47,16 +47,16 @@ torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob)
                     target_prob.scalar_type() == torch::kHalf,
                 "input_log_prob and target_prob must be float16");
 
-    auto output = torch::empty({}, input_log_prob.options());
+    auto output = torch::empty({}, input_log_prob.options().dtype(torch::kFloat));
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {1, 1, 1};
+    cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     kl_divergence_loss_kernel<<<dim, ktype, queue>>>(
         (half *)input_log_prob.data_ptr(),
         (half *)target_prob.data_ptr(),
-        (half *)output.data_ptr(),
-        input_log_prob.size(0),
-        input_log_prob.numel());
+        output.data_ptr<float>(),
+        static_cast<int>(input_log_prob.size(0)),
+        static_cast<int>(input_log_prob.numel()));
     return output;
 }

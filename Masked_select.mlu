@@ -7,13 +7,6 @@
 #define AICS_BANGC_MASKED_SELECT_HELPERS
 
 __nram__ int64_t scalar_i64_buffer[1];
-__nram__ char scalar_mask_buffer[1];
-
-__mlu_func__ char load_mask(char *ptr) {
-    __memcpy(scalar_mask_buffer, ptr, sizeof(char), GDRAM2NRAM);
-    return scalar_mask_buffer[0];
-}
-
 __mlu_func__ void store_int64_masked_select(int64_t *ptr, int64_t value) {
     scalar_i64_buffer[0] = value;
     __memcpy(ptr, scalar_i64_buffer, sizeof(int64_t), NRAM2GDRAM);
@@ -23,43 +16,41 @@ __mlu_func__ void store_int64_masked_select(int64_t *ptr, int64_t value) {
 
 __mlu_entry__ void masked_select_kernel(
     half *input,
-    char *mask,
     half *output,
     int64_t *count,
-    int total) {
+    int total,
+    float threshold) {
     if (taskId != 0) {
         return;
     }
 
     int64_t out_pos = 0;
     for (int i = 0; i < total; ++i) {
-        if (load_mask(mask + i) != 0) {
-            __store_gdram(output + out_pos, __load_gdram(input + i));
+        float value = (float)__load_gdram(input + i);
+        if (value > threshold) {
+            __store_gdram(output + out_pos, (half)value);
             ++out_pos;
         }
     }
     store_int64_masked_select(count, out_pos);
 }
 
-torch::Tensor bang_func(torch::Tensor input, torch::Tensor mask) {
+torch::Tensor bang_func(torch::Tensor input, double threshold) {
     TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
-    TORCH_CHECK(mask.is_contiguous(), "mask must be contiguous");
-    TORCH_CHECK(mask.numel() == input.numel(), "mask size must match input");
     TORCH_CHECK(input.scalar_type() == torch::kHalf, "input must be float16");
-    TORCH_CHECK(mask.scalar_type() == torch::kBool, "mask must be bool");
 
     auto output = torch::empty({input.numel()}, input.options());
     auto count = torch::empty({1}, input.options().dtype(torch::kLong));
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {1, 1, 1};
+    cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     masked_select_kernel<<<dim, ktype, queue>>>(
         (half *)input.data_ptr(),
-        (char *)mask.data_ptr(),
         (half *)output.data_ptr(),
         count.data_ptr<int64_t>(),
-        input.numel());
+        static_cast<int>(input.numel()),
+        static_cast<float>(threshold));
 
     auto count_cpu = count.to(torch::kCPU);
     int64_t valid = count_cpu.data_ptr<int64_t>()[0];
