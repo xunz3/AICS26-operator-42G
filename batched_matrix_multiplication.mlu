@@ -8,7 +8,7 @@
 __mlu_entry__ void batched_matrix_multiplication_kernel(
     half *A,
     half *B,
-    half *output,
+    float *output,
     int batch,
     int M,
     int K,
@@ -18,7 +18,6 @@ __mlu_entry__ void batched_matrix_multiplication_kernel(
     int core_id = taskId;
     int core_num = taskDim;
     __nram__ half b_block[BMM_N_BLOCK];
-    __nram__ half out_block[BMM_N_BLOCK];
     __nram__ float b_float[BMM_N_BLOCK];
     __nram__ float sum_float[BMM_N_BLOCK];
 
@@ -43,10 +42,9 @@ __mlu_entry__ void batched_matrix_multiplication_kernel(
                 __bang_add(sum_float, sum_float, b_float, aligned_len);
             }
         }
-        __bang_float2half_rn(out_block, sum_float, aligned_len);
         __memcpy(output + (b * M + m) * N + n_base,
-                 out_block,
-                 block_len * sizeof(half),
+                 sum_float,
+                 block_len * sizeof(float),
                  NRAM2GDRAM);
     }
 }
@@ -59,7 +57,8 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.scalar_type() == torch::kHalf && B.scalar_type() == torch::kHalf,
                 "A and B must be float16");
 
-    auto output = torch::empty({A.size(0), A.size(1), B.size(2)}, A.options());
+    auto output = torch::empty({A.size(0), A.size(1), B.size(2)},
+                               A.options().dtype(torch::kFloat));
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {64, 1, 1};
@@ -67,7 +66,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     batched_matrix_multiplication_kernel<<<dim, ktype, queue>>>(
         (half *)A.data_ptr(),
         (half *)B.data_ptr(),
-        (half *)output.data_ptr(),
+        (float *)output.data_ptr(),
         A.size(0),
         A.size(1),
         A.size(2),

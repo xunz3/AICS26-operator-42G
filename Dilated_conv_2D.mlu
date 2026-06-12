@@ -3,10 +3,12 @@
 #include <cnrt.h>
 #include <stdint.h>
 
+#define DILATED_OC_BLOCK 64
+
 __mlu_entry__ void dilated_conv_2d_kernel(
     half *x,
     half *kernel,
-    half *output,
+    float *output,
     int batch,
     int in_channels,
     int height,
@@ -20,17 +22,29 @@ __mlu_entry__ void dilated_conv_2d_kernel(
     int out_w,
     int start_idx,
     int work_count) {
+    int oc_blocks = (out_channels + DILATED_OC_BLOCK - 1) / DILATED_OC_BLOCK;
     int core_id = taskId;
     int core_num = taskDim;
+    __nram__ half weight_half[DILATED_OC_BLOCK];
+    __nram__ float weight_float[DILATED_OC_BLOCK];
+    __nram__ float sum_float[DILATED_OC_BLOCK];
 
     for (int local_idx = core_id; local_idx < work_count; local_idx += core_num) {
         int idx = start_idx + local_idx;
-        int ow = idx % out_w;
-        int oh = (idx / out_w) % out_h;
-        int oc = (idx / (out_w * out_h)) % out_channels;
-        int b = idx / (out_channels * out_h * out_w);
+        int oc_block = idx % oc_blocks;
+        int spatial = idx / oc_blocks;
+        int ow = spatial % out_w;
+        int oh = (spatial / out_w) % out_h;
+        int b = spatial / (out_h * out_w);
+        int oc_base = oc_block * DILATED_OC_BLOCK;
+        int block_len = out_channels - oc_base < DILATED_OC_BLOCK
+                            ? out_channels - oc_base
+                            : DILATED_OC_BLOCK;
+        int aligned_len = (block_len + 63) & ~63;
 
-        float sum = 0.0f;
+        for (int i = 0; i < aligned_len; ++i) {
+            sum_float[i] = 0.0f;
+        }
         for (int ic = 0; ic < in_channels; ++ic) {
             for (int kh = 0; kh < kernel_size; ++kh) {
                 int ih = oh * stride - padding + kh * dilation;
@@ -42,15 +56,24 @@ __mlu_entry__ void dilated_conv_2d_kernel(
                     if (iw < 0 || iw >= width) {
                         continue;
                     }
-                    sum +=
-                        (float)__load_gdram(x + ((b * in_channels + ic) * height + ih) * width + iw) *
-                        (float)__load_gdram(kernel +
-                                            ((oc * in_channels + ic) * kernel_size + kh) * kernel_size +
-                                                kw);
+                    float input_value =
+                        (float)__load_gdram(x + ((b * in_channels + ic) * height + ih) * width + iw);
+                    for (int oc_offset = 0; oc_offset < block_len; ++oc_offset) {
+                        int oc = oc_base + oc_offset;
+                        weight_half[oc_offset] = __load_gdram(
+                            kernel + ((oc * in_channels + ic) * kernel_size + kh) * kernel_size + kw);
+                    }
+                    __bang_half2float(weight_float, weight_half, aligned_len);
+                    __bang_mul_scalar(weight_float, weight_float, input_value, aligned_len);
+                    __bang_add(sum_float, sum_float, weight_float, aligned_len);
                 }
             }
         }
-        __store_gdram(output + idx, (half)sum);
+        for (int oc_offset = 0; oc_offset < block_len; ++oc_offset) {
+            int oc = oc_base + oc_offset;
+            __store_gdram(output + ((b * out_channels + oc) * out_h + oh) * out_w + ow,
+                          sum_float[oc_offset]);
+        }
     }
 }
 
@@ -78,12 +101,14 @@ torch::Tensor bang_func(
         (x.size(2) + 2 * padding - dilation * (actual_kernel_size - 1) - 1) / stride + 1;
     int64_t out_w =
         (x.size(3) + 2 * padding - dilation * (actual_kernel_size - 1) - 1) / stride + 1;
-    auto output = torch::empty({x.size(0), actual_out_channels, out_h, out_w}, x.options());
+    auto output = torch::empty({x.size(0), actual_out_channels, out_h, out_w},
+                               x.options().dtype(torch::kFloat));
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {64, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-    int64_t total = output.numel();
+    int64_t oc_blocks = (actual_out_channels + DILATED_OC_BLOCK - 1) / DILATED_OC_BLOCK;
+    int64_t total = x.size(0) * out_h * out_w * oc_blocks;
     const int chunk = 1024;
     for (int64_t start = 0; start < total; start += chunk) {
         int work_count = static_cast<int>(
@@ -91,7 +116,7 @@ torch::Tensor bang_func(
         dilated_conv_2d_kernel<<<dim, ktype, queue>>>(
             (half *)x.data_ptr(),
             (half *)kernel.data_ptr(),
-            (half *)output.data_ptr(),
+            (float *)output.data_ptr(),
             x.size(0),
             actual_in_channels,
             x.size(2),

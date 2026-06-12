@@ -3,11 +3,13 @@
 #include <cnrt.h>
 #include <stdint.h>
 
+#define TRANSPOSE_OC_BLOCK 64
+
 __mlu_entry__ void conv_transposed_2d_square_kernel(
     half *x,
     half *weight,
     half *bias,
-    half *output,
+    float *output,
     int batch,
     int in_channels,
     int h_in,
@@ -26,17 +28,35 @@ __mlu_entry__ void conv_transposed_2d_square_kernel(
     int core_num = taskDim;
     int in_per_group = in_channels / groups;
     int out_per_group = out_channels / groups;
+    int oc_blocks_per_group = (out_per_group + TRANSPOSE_OC_BLOCK - 1) / TRANSPOSE_OC_BLOCK;
+    __nram__ half weight_half[TRANSPOSE_OC_BLOCK];
+    __nram__ float weight_float[TRANSPOSE_OC_BLOCK];
+    __nram__ float sum_float[TRANSPOSE_OC_BLOCK];
 
     for (int local_idx = core_id; local_idx < work_count; local_idx += core_num) {
         int idx = start_idx + local_idx;
-        int ow = idx % w_out;
-        int oh = (idx / w_out) % h_out;
-        int oc = (idx / (h_out * w_out)) % out_channels;
-        int b = idx / (out_channels * h_out * w_out);
-        int group = oc / out_per_group;
-        int ocg = oc - group * out_per_group;
+        int oc_block = idx % oc_blocks_per_group;
+        int group = (idx / oc_blocks_per_group) % groups;
+        int spatial = idx / (oc_blocks_per_group * groups);
+        int ow = spatial % w_out;
+        int oh = (spatial / w_out) % h_out;
+        int b = spatial / (h_out * w_out);
+        int ocg_base = oc_block * TRANSPOSE_OC_BLOCK;
+        int block_len = out_per_group - ocg_base < TRANSPOSE_OC_BLOCK
+                            ? out_per_group - ocg_base
+                            : TRANSPOSE_OC_BLOCK;
+        int aligned_len = (block_len + 63) & ~63;
         int ic_start = group * in_per_group;
-        float sum = has_bias ? (float)__load_gdram(bias + oc) : 0.0f;
+
+        for (int i = 0; i < aligned_len; ++i) {
+            sum_float[i] = 0.0f;
+        }
+        if (has_bias) {
+            for (int oc_offset = 0; oc_offset < block_len; ++oc_offset) {
+                int oc = group * out_per_group + ocg_base + oc_offset;
+                sum_float[oc_offset] = (float)__load_gdram(bias + oc);
+            }
+        }
 
         for (int icg = 0; icg < in_per_group; ++icg) {
             int ic = ic_start + icg;
@@ -58,16 +78,26 @@ __mlu_entry__ void conv_transposed_2d_square_kernel(
                     if (iw < 0 || iw >= w_in) {
                         continue;
                     }
-                    sum +=
-                        (float)__load_gdram(x + ((b * in_channels + ic) * h_in + ih) * w_in + iw) *
-                        (float)__load_gdram(weight +
-                                            ((ic * out_per_group + ocg) * kernel_size + kh) *
-                                                kernel_size +
-                                            kw);
+                    float input_value =
+                        (float)__load_gdram(x + ((b * in_channels + ic) * h_in + ih) * w_in + iw);
+                    for (int oc_offset = 0; oc_offset < block_len; ++oc_offset) {
+                        int ocg = ocg_base + oc_offset;
+                        weight_half[oc_offset] = __load_gdram(
+                            weight + ((ic * out_per_group + ocg) * kernel_size + kh) *
+                                         kernel_size +
+                                     kw);
+                    }
+                    __bang_half2float(weight_float, weight_half, aligned_len);
+                    __bang_mul_scalar(weight_float, weight_float, input_value, aligned_len);
+                    __bang_add(sum_float, sum_float, weight_float, aligned_len);
                 }
             }
         }
-        __store_gdram(output + idx, (half)sum);
+        for (int oc_offset = 0; oc_offset < block_len; ++oc_offset) {
+            int oc = group * out_per_group + ocg_base + oc_offset;
+            __store_gdram(output + ((b * out_channels + oc) * h_out + oh) * w_out + ow,
+                          sum_float[oc_offset]);
+        }
     }
 }
 
@@ -100,12 +130,16 @@ torch::Tensor bang_func(
         (x.size(2) - 1) * stride - 2 * padding + actual_kernel_size + output_padding);
     int w_out = static_cast<int>(
         (x.size(3) - 1) * stride - 2 * padding + actual_kernel_size + output_padding);
-    auto output = torch::empty({x.size(0), actual_out_channels, h_out, w_out}, x.options());
+    auto output = torch::empty({x.size(0), actual_out_channels, h_out, w_out},
+                               x.options().dtype(torch::kFloat));
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {64, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-    int64_t total = output.numel();
+    int out_per_group = actual_out_channels / groups;
+    int64_t oc_blocks_per_group =
+        (out_per_group + TRANSPOSE_OC_BLOCK - 1) / TRANSPOSE_OC_BLOCK;
+    int64_t total = x.size(0) * h_out * w_out * groups * oc_blocks_per_group;
     const int chunk = 1024;
     for (int64_t start = 0; start < total; start += chunk) {
         int work_count = static_cast<int>(
@@ -114,7 +148,7 @@ torch::Tensor bang_func(
             (half *)x.data_ptr(),
             (half *)weight.data_ptr(),
             (half *)dummy_bias.data_ptr(),
-            (half *)output.data_ptr(),
+            (float *)output.data_ptr(),
             x.size(0),
             actual_in_channels,
             x.size(2),
