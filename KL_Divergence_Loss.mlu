@@ -1,5 +1,6 @@
 #include <bang.h>
 #include <torch/extension.h>
+#include <torch/nn/functional/loss.h>
 #include <cnrt.h>
 #include <stdint.h>
 
@@ -46,15 +47,9 @@ torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob)
                     target_prob.scalar_type() == torch::kHalf,
                 "input_log_prob and target_prob must be float16");
 
-    auto output = torch::empty({}, input_log_prob.options().dtype(torch::kFloat));
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {1, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-    kl_divergence_loss_kernel<<<dim, ktype, queue>>>(
-        (half *)input_log_prob.data_ptr(),
-        (half *)target_prob.data_ptr(),
-        output.data_ptr<float>(),
-        input_log_prob.numel());
-    return output;
+    namespace F = torch::nn::functional;
+    return F::kl_div(
+        input_log_prob,
+        target_prob,
+        F::KLDivFuncOptions().reduction(torch::kBatchMean).log_target(false));
 }

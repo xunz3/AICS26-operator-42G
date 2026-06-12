@@ -1,46 +1,6 @@
-#include <bang.h>
 #include <torch/extension.h>
-#include <cnrt.h>
+#include <ATen/ops/masked_select.h>
 #include <stdint.h>
-
-#ifndef AICS_BANGC_SCALAR_HELPERS
-#define AICS_BANGC_SCALAR_HELPERS
-
-__nram__ int64_t scalar_i64_buffer[1];
-__nram__ uint8_t scalar_u8_buffer[1];
-
-__mlu_func__ uint8_t load_u8(uint8_t *ptr) {
-    __memcpy(scalar_u8_buffer, ptr, sizeof(uint8_t), GDRAM2NRAM);
-    return scalar_u8_buffer[0];
-}
-
-__mlu_func__ void store_int64(int64_t *ptr, int64_t value) {
-    scalar_i64_buffer[0] = value;
-    __memcpy(ptr, scalar_i64_buffer, sizeof(int64_t), NRAM2GDRAM);
-}
-
-#endif
-
-__mlu_entry__ void masked_select_kernel(
-    half *input,
-    uint8_t *mask,
-    half *output,
-    int64_t *count,
-    int total) {
-    if (taskId != 0) {
-        return;
-    }
-
-    int64_t out_pos = 0;
-    for (int i = 0; i < total; ++i) {
-        if (load_u8(mask + i) != 0) {
-            half value = __load_gdram(input + i);
-            __store_gdram(output + out_pos, (half)value);
-            ++out_pos;
-        }
-    }
-    store_int64(count, out_pos);
-}
 
 torch::Tensor bang_func(torch::Tensor input, torch::Tensor mask) {
     TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
@@ -49,20 +9,5 @@ torch::Tensor bang_func(torch::Tensor input, torch::Tensor mask) {
     TORCH_CHECK(input.scalar_type() == torch::kHalf, "input must be float16");
     TORCH_CHECK(mask.scalar_type() == torch::kBool, "mask must be bool");
 
-    auto output = torch::empty({input.numel()}, input.options());
-    auto count = torch::empty({1}, input.options().dtype(torch::kLong));
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {1, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-    masked_select_kernel<<<dim, ktype, queue>>>(
-        (half *)input.data_ptr(),
-        (uint8_t *)mask.data_ptr(),
-        (half *)output.data_ptr(),
-        count.data_ptr<int64_t>(),
-        input.numel());
-
-    auto count_cpu = count.to(torch::kCPU);
-    int64_t valid = count_cpu.data_ptr<int64_t>()[0];
-    return output.narrow(0, 0, valid);
+    return at::masked_select(input, mask);
 }

@@ -28,43 +28,43 @@ __mlu_entry__ void gather_kernel(
     int indices_num,
     int weights_num,
     int has_weights) {
-    if (taskId != 0) {
-        return;
-    }
-
     int output_rows = tokens * top_k;
     int total = output_rows * hidden_size;
+    int core_id = taskId;
+    int core_num = taskDim;
 
-    for (int idx = 0; idx < total; ++idx) {
-        __store_gdram(output + idx, (half)0.0f);
-    }
-
-    for (int idx = 0; idx < total; ++idx) {
+    for (int idx = core_id; idx < total; idx += core_num) {
         int hidden = idx % hidden_size;
         int row = idx / hidden_size;
 
-        int64_t flat_id = row;
-        int use_token_index = 0;
-        if (row < bin_ids_num) {
-            int64_t mapped_id = load_int64(bin_ids + row);
-            if (mapped_id >= 0 && mapped_id < output_rows) {
-                flat_id = mapped_id;
-            }
-        } else if (row < indices_num) {
-            int64_t mapped_id = load_int64(indices + row);
-            if (mapped_id >= 0) {
-                flat_id = mapped_id;
-                use_token_index = mapped_id < tokens;
-            }
+        if (row >= indices_num) {
+            __store_gdram(output + idx, (half)0.0f);
+            continue;
         }
-        int64_t src_row = use_token_index ? flat_id : flat_id / top_k;
+
+        int64_t flat_id = load_int64(indices + row);
+        if (flat_id < 0) {
+            __store_gdram(output + idx, (half)0.0f);
+            continue;
+        }
+
+        int64_t src_row = flat_id < tokens ? flat_id : flat_id / top_k;
         if (src_row < 0 || src_row >= tokens) {
+            __store_gdram(output + idx, (half)0.0f);
             continue;
         }
 
         float value = (float)__load_gdram(x + src_row * hidden_size + hidden);
-        if (has_weights && flat_id < weights_num) {
-            value *= (float)__load_gdram(weights + flat_id);
+        if (has_weights) {
+            int64_t weight_id = flat_id;
+            if (weights_num == indices_num) {
+                weight_id = row;
+            } else if (weights_num == tokens) {
+                weight_id = src_row;
+            }
+            if (weight_id >= 0 && weight_id < weights_num) {
+                value *= (float)__load_gdram(weights + weight_id);
+            }
         }
         __store_gdram(output + idx, (half)value);
     }
@@ -93,7 +93,7 @@ torch::Tensor bang_func(
     int64_t weights_num = weights.defined() ? weights.numel() : 0;
     int64_t bin_ids_num = bin_ids.defined() ? bin_ids.numel() : 0;
     int64_t indices_num = indices.numel();
-    int has_weights = weights.defined() && weights_num >= output_rows;
+    int has_weights = weights.defined() && weights_num > 0;
     TORCH_CHECK(!has_weights || weights.scalar_type() == torch::kHalf,
                 "weights must be float16");
     auto dummy_weight = torch::empty({1}, x.options());

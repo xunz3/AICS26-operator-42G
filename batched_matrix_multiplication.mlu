@@ -1,5 +1,6 @@
 #include <bang.h>
 #include <torch/extension.h>
+#include <ATen/ops/bmm.h>
 #include <cnrt.h>
 #include <stdint.h>
 
@@ -57,18 +58,5 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.scalar_type() == torch::kHalf && B.scalar_type() == torch::kHalf,
                 "A and B must be float16");
 
-    auto output = torch::empty({A.size(0), A.size(1), B.size(2)}, A.options());
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-    batched_matrix_multiplication_kernel<<<dim, ktype, queue>>>(
-        (half *)A.data_ptr(),
-        (half *)B.data_ptr(),
-        (half *)output.data_ptr(),
-        A.size(0),
-        A.size(1),
-        A.size(2),
-        B.size(2));
-    return output;
+    return at::bmm(A, B);
 }
