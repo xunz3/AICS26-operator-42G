@@ -2,11 +2,11 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <vector>
-#include "bangc_scalar.h"
+#include <stdint.h>
 
 __mlu_entry__ void cumsum_kernel(
-    float *x,
-    float *output,
+    half *x,
+    half *output,
     int outer,
     int dim_size,
     int inner) {
@@ -20,8 +20,8 @@ __mlu_entry__ void cumsum_kernel(
         float sum = 0.0f;
         for (int d = 0; d < dim_size; ++d) {
             int offset = (outer_idx * dim_size + d) * inner + inner_idx;
-            sum += load_float(x + offset);
-            store_float(output + offset, sum);
+            sum += (float)__load_gdram(x + offset);
+            __store_gdram(output + offset, (half)sum);
         }
     }
 }
@@ -32,27 +32,27 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
         dim += x.dim();
     }
     TORCH_CHECK(dim >= 0 && dim < x.dim(), "dim out of range");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
 
-    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
-    auto output = torch::empty_like(x_fp32);
+    auto output = torch::empty_like(x);
 
     int64_t outer = 1;
     int64_t inner = 1;
     for (int i = 0; i < dim; ++i) {
-        outer *= x_fp32.size(i);
+        outer *= x.size(i);
     }
-    for (int i = dim + 1; i < x_fp32.dim(); ++i) {
-        inner *= x_fp32.size(i);
+    for (int i = dim + 1; i < x.dim(); ++i) {
+        inner *= x.size(i);
     }
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t kdim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     cumsum_kernel<<<kdim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
+        (half *)x.data_ptr(),
+        (half *)output.data_ptr(),
         outer,
-        x_fp32.size(dim),
+        x.size(dim),
         inner);
     return output;
 }

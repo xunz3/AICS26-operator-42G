@@ -2,11 +2,28 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <vector>
-#include "bangc_scalar.h"
+#include <stdint.h>
+
+#ifndef AICS_BANGC_SCALAR_HELPERS
+#define AICS_BANGC_SCALAR_HELPERS
+
+__nram__ int64_t scalar_i64_buffer[1];
+
+__mlu_func__ int64_t load_int64(int64_t *ptr) {
+    __memcpy(scalar_i64_buffer, ptr, sizeof(int64_t), GDRAM2NRAM);
+    return scalar_i64_buffer[0];
+}
+
+__mlu_func__ void store_int64(int64_t *ptr, int64_t value) {
+    scalar_i64_buffer[0] = value;
+    __memcpy(ptr, scalar_i64_buffer, sizeof(int64_t), NRAM2GDRAM);
+}
+
+#endif
 
 __mlu_entry__ void topk_kernel(
-    float *x,
-    float *values,
+    half *x,
+    half *values,
     int64_t *indices,
     int rows,
     int cols,
@@ -21,7 +38,7 @@ __mlu_entry__ void topk_kernel(
                 float best = -3.402823466e+38f;
                 int64_t best_idx = 0;
                 for (int c = 0; c < cols; ++c) {
-                    float value = load_float(x + row * cols + c);
+                    float value = (float)__load_gdram(x + row * cols + c);
                     bool used = false;
                     for (int prev = 0; prev < out; ++prev) {
                         if (load_int64(indices + row * k + prev) == c) {
@@ -33,7 +50,7 @@ __mlu_entry__ void topk_kernel(
                         best_idx = c;
                     }
                 }
-                store_float(values + row * k + out, best);
+                __store_gdram(values + row * k + out, (half)best);
                 store_int64(indices + row * k + out, best_idx);
             }
         }
@@ -43,7 +60,7 @@ __mlu_entry__ void topk_kernel(
                 float best = -3.402823466e+38f;
                 int64_t best_idx = 0;
                 for (int r = 0; r < rows; ++r) {
-                    float value = load_float(x + r * cols + col);
+                    float value = (float)__load_gdram(x + r * cols + col);
                     bool used = false;
                     for (int prev = 0; prev < out; ++prev) {
                         if (load_int64(indices + prev * cols + col) == r) {
@@ -55,7 +72,7 @@ __mlu_entry__ void topk_kernel(
                         best_idx = r;
                     }
                 }
-                store_float(values + out * cols + col, best);
+                __store_gdram(values + out * cols + col, (half)best);
                 store_int64(indices + out * cols + col, best_idx);
             }
         }
@@ -65,26 +82,31 @@ __mlu_entry__ void topk_kernel(
 std::vector<torch::Tensor> bang_func(torch::Tensor x, int k, int dim) {
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(x.dim() == 2, "x must be [batch, dim]");
+    if (dim < 0) {
+        dim += x.dim();
+    }
+    TORCH_CHECK(dim == 0 || dim == 1, "dim must be 0 or 1");
+    TORCH_CHECK(k >= 0 && k <= x.size(dim), "k out of range");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
 
-    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
     std::vector<int64_t> out_shape;
     if (dim == 0) {
         out_shape = {k, x.size(1)};
     } else {
         out_shape = {x.size(0), k};
     }
-    auto values = torch::empty(out_shape, x_fp32.options());
+    auto values = torch::empty(out_shape, x.options());
     auto indices = torch::empty(out_shape, x.options().dtype(torch::kLong));
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t kdim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     topk_kernel<<<kdim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        values.data_ptr<float>(),
+        (half *)x.data_ptr(),
+        (half *)values.data_ptr(),
         indices.data_ptr<int64_t>(),
-        x_fp32.size(0),
-        x_fp32.size(1),
+        x.size(0),
+        x.size(1),
         k,
         dim);
     return {values, indices};

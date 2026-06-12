@@ -1,11 +1,11 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "bangc_scalar.h"
+#include <stdint.h>
 
 __mlu_entry__ void average_pooling_2d_kernel(
-    float *x,
-    float *output,
+    half *x,
+    half *output,
     int batch,
     int channels,
     int height,
@@ -39,10 +39,10 @@ __mlu_entry__ void average_pooling_2d_kernel(
                 if (iw < 0 || iw >= width) {
                     continue;
                 }
-                sum += load_float(x + ((b * channels + c) * height + ih) * width + iw);
+                sum += (float)__load_gdram(x + ((b * channels + c) * height + ih) * width + iw);
             }
         }
-        store_float(output + idx, sum / denom);
+        __store_gdram(output + idx, (half)(sum / denom));
     }
 }
 
@@ -53,22 +53,22 @@ torch::Tensor bang_func(
     int padding) {
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(x.dim() == 4, "x must be [batch, channels, height, width]");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
 
-    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
     int64_t out_h = (x.size(2) + 2 * padding - kernel_size) / stride + 1;
     int64_t out_w = (x.size(3) + 2 * padding - kernel_size) / stride + 1;
-    auto output = torch::empty({x.size(0), x.size(1), out_h, out_w}, x_fp32.options());
+    auto output = torch::empty({x.size(0), x.size(1), out_h, out_w}, x.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     average_pooling_2d_kernel<<<dim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
-        x_fp32.size(0),
-        x_fp32.size(1),
-        x_fp32.size(2),
-        x_fp32.size(3),
+        (half *)x.data_ptr(),
+        (half *)output.data_ptr(),
+        x.size(0),
+        x.size(1),
+        x.size(2),
+        x.size(3),
         out_h,
         out_w,
         kernel_size,

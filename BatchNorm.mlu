@@ -1,11 +1,24 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "bangc_scalar.h"
+#include <stdint.h>
+
+#ifndef AICS_BANGC_SCALAR_HELPERS
+#define AICS_BANGC_SCALAR_HELPERS
+
+__nram__ float scalar_f_buffer[1];
+
+__mlu_func__ float scalar_sqrt(float value) {
+    scalar_f_buffer[0] = value;
+    __bang_sqrt(scalar_f_buffer, scalar_f_buffer, 1);
+    return scalar_f_buffer[0];
+}
+
+#endif
 
 __mlu_entry__ void batchnorm_kernel(
-    float *x,
-    float *output,
+    half *x,
+    half *output,
     int batch,
     int channels,
     int height,
@@ -26,7 +39,7 @@ __mlu_entry__ void batchnorm_kernel(
         for (int rb = 0; rb < batch; ++rb) {
             for (int rh = 0; rh < height; ++rh) {
                 for (int rw = 0; rw < width; ++rw) {
-                    mean += load_float(x + ((rb * channels + c) * height + rh) * width + rw);
+                    mean += (float)__load_gdram(x + ((rb * channels + c) * height + rh) * width + rw);
                 }
             }
         }
@@ -37,16 +50,17 @@ __mlu_entry__ void batchnorm_kernel(
             for (int rh = 0; rh < height; ++rh) {
                 for (int rw = 0; rw < width; ++rw) {
                     float value =
-                        load_float(x + ((rb * channels + c) * height + rh) * width + rw) -
+                        (float)__load_gdram(x + ((rb * channels + c) * height + rh) * width + rw) -
                         mean;
                     var += value * value;
                 }
             }
         }
         var /= (float)reduce_size;
-        store_float(output + idx,
-                    (load_float(x + ((b * channels + c) * height + h) * width + w) - mean) /
-                        scalar_sqrt(var + eps));
+        __store_gdram(output + idx,
+                      (half)(((float)__load_gdram(x + ((b * channels + c) * height + h) * width + w) -
+                              mean) /
+                             scalar_sqrt(var + eps)));
     }
 }
 
@@ -54,20 +68,20 @@ torch::Tensor bang_func(torch::Tensor x, int num_features) {
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(x.dim() == 4, "BatchNorm expects a 4D tensor");
     TORCH_CHECK(x.size(1) == num_features, "num_features must match channel dimension");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
 
-    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
-    auto output = torch::empty_like(x_fp32);
+    auto output = torch::empty_like(x);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     batchnorm_kernel<<<dim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
-        x_fp32.size(0),
-        x_fp32.size(1),
-        x_fp32.size(2),
-        x_fp32.size(3),
+        (half *)x.data_ptr(),
+        (half *)output.data_ptr(),
+        x.size(0),
+        x.size(1),
+        x.size(2),
+        x.size(3),
         1e-5f);
     return output;
 }

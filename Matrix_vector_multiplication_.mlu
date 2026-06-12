@@ -1,22 +1,42 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "bangc_scalar.h"
+#include <stdint.h>
+
+#define MATVEC_CHUNK_SIZE 1024
 
 __mlu_entry__ void matrix_vector_multiplication_kernel(
-    float *A,
-    float *B,
-    float *output,
+    half *A,
+    half *B,
+    half *output,
     int M,
     int K) {
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
+    __nram__ half nram_a[MATVEC_CHUNK_SIZE];
+    __nram__ half nram_b[MATVEC_CHUNK_SIZE];
+    __nram__ float nram_a_f[MATVEC_CHUNK_SIZE];
+    __nram__ float nram_b_f[MATVEC_CHUNK_SIZE];
+    __nram__ float nram_prod[MATVEC_CHUNK_SIZE];
+
     for (int row = core_id; row < M; row += core_num) {
         float sum = 0.0f;
-        for (int k = 0; k < K; ++k) {
-            sum += load_float(A + row * K + k) * load_float(B + k);
+        int k = 0;
+        for (; k + MATVEC_CHUNK_SIZE <= K; k += MATVEC_CHUNK_SIZE) {
+            __memcpy(nram_a, A + row * K + k,
+                     MATVEC_CHUNK_SIZE * sizeof(half), GDRAM2NRAM);
+            __memcpy(nram_b, B + k,
+                     MATVEC_CHUNK_SIZE * sizeof(half), GDRAM2NRAM);
+            __bang_half2float(nram_a_f, nram_a, MATVEC_CHUNK_SIZE);
+            __bang_half2float(nram_b_f, nram_b, MATVEC_CHUNK_SIZE);
+            __bang_mul(nram_prod, nram_a_f, nram_b_f, MATVEC_CHUNK_SIZE);
+            sum += __bang_sum(nram_prod, MATVEC_CHUNK_SIZE);
         }
-        store_float(output + row, sum);
+        for (; k < K; ++k) {
+            sum += (float)__load_gdram(A + row * K + k) *
+                   (float)__load_gdram(B + k);
+        }
+        __store_gdram(output + row, (half)sum);
     }
 }
 
@@ -25,19 +45,19 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 2, "A must be [M, K]");
     TORCH_CHECK(B.numel() == A.size(1), "B must have K elements");
+    TORCH_CHECK(A.scalar_type() == torch::kHalf && B.scalar_type() == torch::kHalf,
+                "A and B must be float16");
 
-    torch::Tensor A_fp32 = A.scalar_type() == torch::kFloat ? A : A.to(torch::kFloat);
-    torch::Tensor B_fp32 = B.scalar_type() == torch::kFloat ? B : B.to(torch::kFloat);
-    auto output = torch::empty({A.size(0), 1}, A_fp32.options());
+    auto output = torch::empty({A.size(0), 1}, A.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     matrix_vector_multiplication_kernel<<<dim, ktype, queue>>>(
-        A_fp32.data_ptr<float>(),
-        B_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
-        A_fp32.size(0),
-        A_fp32.size(1));
+        (half *)A.data_ptr(),
+        (half *)B.data_ptr(),
+        (half *)output.data_ptr(),
+        A.size(0),
+        A.size(1));
     return output;
 }

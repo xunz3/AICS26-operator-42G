@@ -4,7 +4,7 @@
 
 #define CHUNK_SIZE 4096
 
-__mlu_entry__ void sqrt_abs_kernel(float *input, float *output, int total) {
+__mlu_entry__ void sqrt_abs_kernel(half *input, half *output, int total) {
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = total / core_num;
@@ -12,39 +12,35 @@ __mlu_entry__ void sqrt_abs_kernel(float *input, float *output, int total) {
     uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
     uint32_t count = per_core + (core_id < remainder ? 1 : 0);
 
-    __nram__ float nram_input[CHUNK_SIZE];
-    __nram__ float nram_output[CHUNK_SIZE];
+    __nram__ half nram_input[CHUNK_SIZE];
+    __nram__ float nram_float[CHUNK_SIZE];
+    __nram__ half nram_output[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
         uint32_t aligned_len = (len + 63) & ~63;
 
-        __memcpy(nram_input, input + start + offset, len * sizeof(float), GDRAM2NRAM);
-        __bang_abs(nram_output, nram_input, aligned_len);
-        __bang_sqrt(nram_output, nram_output, aligned_len);
-        __memcpy(output + start + offset, nram_output, len * sizeof(float), NRAM2GDRAM);
+        __memcpy(nram_input, input + start + offset, len * sizeof(half), GDRAM2NRAM);
+        __bang_half2float(nram_float, nram_input, aligned_len);
+        __bang_abs(nram_float, nram_float, aligned_len);
+        __bang_sqrt(nram_float, nram_float, aligned_len);
+        __bang_float2half_rn(nram_output, nram_float, aligned_len);
+        __memcpy(output + start + offset, nram_output, len * sizeof(half), NRAM2GDRAM);
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x) {
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
-    auto original_dtype = x.scalar_type();
-    torch::Tensor input_fp32 = x;
-    if (original_dtype != torch::kFloat) {
-        input_fp32 = x.to(torch::kFloat);
-    }
-    auto output_fp32 = torch::empty_like(input_fp32);
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
+    auto output = torch::empty_like(x);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     sqrt_abs_kernel<<<dim, ktype, queue>>>(
-        input_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        input_fp32.numel());
+        (half *)x.data_ptr(),
+        (half *)output.data_ptr(),
+        x.numel());
 
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
-    }
-    return output_fp32;
+    return output;
 }

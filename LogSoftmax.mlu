@@ -1,11 +1,32 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "bangc_scalar.h"
+#include <stdint.h>
+
+#ifndef AICS_BANGC_SCALAR_HELPERS
+#define AICS_BANGC_SCALAR_HELPERS
+
+__nram__ float scalar_f_buffer[1];
+
+__mlu_func__ float scalar_exp(float value) {
+    scalar_f_buffer[0] = value;
+    __bang_mul_scalar(scalar_f_buffer, scalar_f_buffer, 1.4426950408889634f, 1);
+    __bang_pow2(scalar_f_buffer, scalar_f_buffer, 1);
+    return scalar_f_buffer[0];
+}
+
+__mlu_func__ float scalar_log(float value) {
+    scalar_f_buffer[0] = value;
+    __bang_log2(scalar_f_buffer, scalar_f_buffer, 1);
+    __bang_mul_scalar(scalar_f_buffer, scalar_f_buffer, 0.6931471805599453f, 1);
+    return scalar_f_buffer[0];
+}
+
+#endif
 
 __mlu_entry__ void logsoftmax_kernel(
-    float *x,
-    float *output,
+    half *x,
+    half *output,
     int rows,
     int cols,
     int dim) {
@@ -14,40 +35,42 @@ __mlu_entry__ void logsoftmax_kernel(
 
     if (dim == 1 || dim == -1) {
         for (int row = core_id; row < rows; row += core_num) {
-            float max_value = load_float(x + row * cols);
+            float max_value = (float)__load_gdram(x + row * cols);
             for (int c = 1; c < cols; ++c) {
-                float value = load_float(x + row * cols + c);
+                float value = (float)__load_gdram(x + row * cols + c);
                 if (value > max_value) {
                     max_value = value;
                 }
             }
             float sum = 0.0f;
             for (int c = 0; c < cols; ++c) {
-                sum += scalar_exp(load_float(x + row * cols + c) - max_value);
+                sum += scalar_exp((float)__load_gdram(x + row * cols + c) - max_value);
             }
             float log_sum = scalar_log(sum);
             for (int c = 0; c < cols; ++c) {
-                store_float(output + row * cols + c,
-                            load_float(x + row * cols + c) - max_value - log_sum);
+                __store_gdram(output + row * cols + c,
+                              (half)((float)__load_gdram(x + row * cols + c) -
+                                     max_value - log_sum));
             }
         }
     } else {
         for (int col = core_id; col < cols; col += core_num) {
-            float max_value = load_float(x + col);
+            float max_value = (float)__load_gdram(x + col);
             for (int r = 1; r < rows; ++r) {
-                float value = load_float(x + r * cols + col);
+                float value = (float)__load_gdram(x + r * cols + col);
                 if (value > max_value) {
                     max_value = value;
                 }
             }
             float sum = 0.0f;
             for (int r = 0; r < rows; ++r) {
-                sum += scalar_exp(load_float(x + r * cols + col) - max_value);
+                sum += scalar_exp((float)__load_gdram(x + r * cols + col) - max_value);
             }
             float log_sum = scalar_log(sum);
             for (int r = 0; r < rows; ++r) {
-                store_float(output + r * cols + col,
-                            load_float(x + r * cols + col) - max_value - log_sum);
+                __store_gdram(output + r * cols + col,
+                              (half)((float)__load_gdram(x + r * cols + col) -
+                                     max_value - log_sum));
             }
         }
     }
@@ -56,18 +79,22 @@ __mlu_entry__ void logsoftmax_kernel(
 torch::Tensor bang_func(torch::Tensor x, int dim) {
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(x.dim() == 2, "x must be [batch_size, dim]");
+    if (dim < 0) {
+        dim += x.dim();
+    }
+    TORCH_CHECK(dim == 0 || dim == 1, "dim must be 0 or 1");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
 
-    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
-    auto output = torch::empty_like(x_fp32);
+    auto output = torch::empty_like(x);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t kdim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     logsoftmax_kernel<<<kdim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
-        x_fp32.size(0),
-        x_fp32.size(1),
+        (half *)x.data_ptr(),
+        (half *)output.data_ptr(),
+        x.size(0),
+        x.size(1),
         dim);
     return output;
 }

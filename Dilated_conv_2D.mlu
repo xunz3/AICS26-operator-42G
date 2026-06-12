@@ -1,12 +1,12 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "bangc_scalar.h"
+#include <stdint.h>
 
 __mlu_entry__ void dilated_conv_2d_kernel(
-    float *x,
-    float *kernel,
-    float *output,
+    half *x,
+    half *kernel,
+    half *output,
     int batch,
     int in_channels,
     int height,
@@ -40,14 +40,14 @@ __mlu_entry__ void dilated_conv_2d_kernel(
                         continue;
                     }
                     sum +=
-                        load_float(x + ((b * in_channels + ic) * height + ih) * width + iw) *
-                        load_float(kernel +
-                                   ((oc * in_channels + ic) * kernel_size + kh) * kernel_size +
-                                       kw);
+                        (float)__load_gdram(x + ((b * in_channels + ic) * height + ih) * width + iw) *
+                        (float)__load_gdram(kernel +
+                                            ((oc * in_channels + ic) * kernel_size + kh) * kernel_size +
+                                                kw);
                 }
             }
         }
-        store_float(output + idx, sum);
+        __store_gdram(output + idx, (half)sum);
     }
 }
 
@@ -61,24 +61,24 @@ torch::Tensor bang_func(
     int padding) {
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(kernel.is_contiguous(), "kernel must be contiguous");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf && kernel.scalar_type() == torch::kHalf,
+                "x and kernel must be float16");
 
-    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
-    torch::Tensor k_fp32 = kernel.scalar_type() == torch::kFloat ? kernel : kernel.to(torch::kFloat);
     int64_t out_h = x.size(2) + 2 * padding - dilation * (kernel_size - 1);
     int64_t out_w = x.size(3) + 2 * padding - dilation * (kernel_size - 1);
-    auto output = torch::empty({x.size(0), out_channels, out_h, out_w}, x_fp32.options());
+    auto output = torch::empty({x.size(0), out_channels, out_h, out_w}, x.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     dilated_conv_2d_kernel<<<dim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        k_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
-        x_fp32.size(0),
+        (half *)x.data_ptr(),
+        (half *)kernel.data_ptr(),
+        (half *)output.data_ptr(),
+        x.size(0),
         in_channels,
-        x_fp32.size(2),
-        x_fp32.size(3),
+        x.size(2),
+        x.size(3),
         out_channels,
         kernel_size,
         dilation,

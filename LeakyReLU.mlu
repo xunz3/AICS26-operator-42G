@@ -5,8 +5,8 @@
 #define CHUNK_SIZE 4096
 
 __mlu_entry__ void leakyrelu_kernel(
-    float *input,
-    float *output,
+    half *input,
+    half *output,
     int total,
     float negative_slope) {
 
@@ -23,6 +23,8 @@ __mlu_entry__ void leakyrelu_kernel(
                      (core_id < remainder ? 1 : 0);
 
     // NRAM
+    __nram__ half nram_input_half[CHUNK_SIZE];
+    __nram__ half nram_output_half[CHUNK_SIZE];
     __nram__ float nram_input[CHUNK_SIZE];
     __nram__ float nram_relu[CHUNK_SIZE];
     __nram__ float nram_temp[CHUNK_SIZE];
@@ -37,10 +39,15 @@ __mlu_entry__ void leakyrelu_kernel(
         uint32_t aligned_len = (len + 63) & ~63;
 
         __memcpy(
-            nram_input,
+            nram_input_half,
             input + start + offset,
-            len * sizeof(float),
+            len * sizeof(half),
             GDRAM2NRAM);
+
+        __bang_half2float(
+            nram_input,
+            nram_input_half,
+            aligned_len);
 
         // relu(x)
         __bang_active_relu(
@@ -69,10 +76,15 @@ __mlu_entry__ void leakyrelu_kernel(
             nram_temp,
             aligned_len);
 
+        __bang_float2half_rn(
+            nram_output_half,
+            nram_temp,
+            aligned_len);
+
         __memcpy(
             output + start + offset,
-            nram_temp,
-            len * sizeof(float),
+            nram_output_half,
+            len * sizeof(half),
             NRAM2GDRAM);
     }
 }
@@ -85,19 +97,11 @@ torch::Tensor bang_func(
     TORCH_CHECK(
         input.is_contiguous(),
         "Input must be contiguous");
+    TORCH_CHECK(input.scalar_type() == torch::kHalf, "Input must be float16");
 
-    // 保留原始 dtype
-    auto original_dtype = input.scalar_type();
+    auto output = torch::empty_like(input);
 
-    // -------- 只处理数据类型 --------
-    torch::Tensor input_fp32 = input;
-    if (original_dtype != torch::kFloat) {
-        input_fp32 = input.to(torch::kFloat);
-    }
-
-    auto output_fp32 = torch::empty_like(input_fp32);
-
-    int total = input_fp32.numel();
+    int total = input.numel();
 
     cnrtQueue_t queue =
         torch_mlu::getCurMLUStream();
@@ -107,16 +111,11 @@ torch::Tensor bang_func(
         cnrtFuncTypeUnion1;
 
     leakyrelu_kernel<<<dim, ktype, queue>>>(
-        input_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
+        (half *)input.data_ptr(),
+        (half *)output.data_ptr(),
         total,
         (float)negative_slope
     );
 
-    // 转回原 dtype
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
-    }
-
-    return output_fp32;
+    return output;
 }

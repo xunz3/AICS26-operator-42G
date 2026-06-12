@@ -2,10 +2,22 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <vector>
-#include "bangc_scalar.h"
+#include <stdint.h>
+
+#ifndef AICS_BANGC_SCALAR_HELPERS
+#define AICS_BANGC_SCALAR_HELPERS
+
+__nram__ int64_t scalar_i64_buffer[1];
+
+__mlu_func__ void store_int64(int64_t *ptr, int64_t value) {
+    scalar_i64_buffer[0] = value;
+    __memcpy(ptr, scalar_i64_buffer, sizeof(int64_t), NRAM2GDRAM);
+}
+
+#endif
 
 __mlu_entry__ void argmax_over_a_dimension_kernel(
-    float *x,
+    half *x,
     int64_t *output,
     int outer,
     int dim_size,
@@ -17,10 +29,10 @@ __mlu_entry__ void argmax_over_a_dimension_kernel(
     for (int idx = core_id; idx < total; idx += core_num) {
         int outer_idx = idx / inner;
         int inner_idx = idx % inner;
-        float max_value = load_float(x + (outer_idx * dim_size) * inner + inner_idx);
+        float max_value = (float)__load_gdram(x + (outer_idx * dim_size) * inner + inner_idx);
         int64_t max_index = 0;
         for (int d = 1; d < dim_size; ++d) {
-            float value = load_float(x + (outer_idx * dim_size + d) * inner + inner_idx);
+            float value = (float)__load_gdram(x + (outer_idx * dim_size + d) * inner + inner_idx);
             if (value > max_value) {
                 max_value = value;
                 max_index = d;
@@ -36,12 +48,12 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
         dim += x.dim();
     }
     TORCH_CHECK(dim >= 0 && dim < x.dim(), "dim out of range");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
 
-    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
     std::vector<int64_t> out_sizes;
-    for (int i = 0; i < x_fp32.dim(); ++i) {
+    for (int i = 0; i < x.dim(); ++i) {
         if (i != dim) {
-            out_sizes.push_back(x_fp32.size(i));
+            out_sizes.push_back(x.size(i));
         }
     }
     auto output = torch::empty(out_sizes, x.options().dtype(torch::kLong));
@@ -49,20 +61,20 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     int64_t outer = 1;
     int64_t inner = 1;
     for (int i = 0; i < dim; ++i) {
-        outer *= x_fp32.size(i);
+        outer *= x.size(i);
     }
-    for (int i = dim + 1; i < x_fp32.dim(); ++i) {
-        inner *= x_fp32.size(i);
+    for (int i = dim + 1; i < x.dim(); ++i) {
+        inner *= x.size(i);
     }
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t kdim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     argmax_over_a_dimension_kernel<<<kdim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
+        (half *)x.data_ptr(),
         output.data_ptr<int64_t>(),
         outer,
-        x_fp32.size(dim),
+        x.size(dim),
         inner);
     return output;
 }

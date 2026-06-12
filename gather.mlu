@@ -1,13 +1,25 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "bangc_scalar.h"
+#include <stdint.h>
+
+#ifndef AICS_BANGC_SCALAR_HELPERS
+#define AICS_BANGC_SCALAR_HELPERS
+
+__nram__ int64_t scalar_i64_buffer[1];
+
+__mlu_func__ int64_t load_int64(int64_t *ptr) {
+    __memcpy(scalar_i64_buffer, ptr, sizeof(int64_t), GDRAM2NRAM);
+    return scalar_i64_buffer[0];
+}
+
+#endif
 
 __mlu_entry__ void gather_kernel(
-    float *x,
+    half *x,
     int64_t *indices,
-    float *weights,
-    float *output,
+    half *weights,
+    half *output,
     int tokens,
     int hidden_size,
     int num_elements,
@@ -22,19 +34,19 @@ __mlu_entry__ void gather_kernel(
         int hidden = idx % hidden_size;
         int row = idx / hidden_size;
         if (row >= num_elements) {
-            store_float(output + idx, 0.0f);
+            __store_gdram(output + idx, (half)0.0f);
             continue;
         }
         int64_t src_row = load_int64(indices + row);
         if (src_row < 0 || src_row >= tokens) {
-            store_float(output + idx, 0.0f);
+            __store_gdram(output + idx, (half)0.0f);
             continue;
         }
-        float value = load_float(x + src_row * hidden_size + hidden);
+        float value = (float)__load_gdram(x + src_row * hidden_size + hidden);
         if (has_weights) {
-            value *= load_float(weights + row);
+            value *= (float)__load_gdram(weights + row);
         }
-        store_float(output + idx, value);
+        __store_gdram(output + idx, (half)value);
     }
 }
 
@@ -50,28 +62,28 @@ torch::Tensor bang_func(
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
     TORCH_CHECK(x.dim() == 2, "x must be [tokens, hidden_size]");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
 
-    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
     torch::Tensor idx_i64 = indices.scalar_type() == torch::kLong ? indices : indices.to(torch::kLong);
-    torch::Tensor w_fp32 = weights;
+    torch::Tensor weights_half = weights;
     int has_weights = weights.defined() && weights.numel() == indices.numel();
-    if (has_weights && weights.scalar_type() != torch::kFloat) {
-        w_fp32 = weights.to(torch::kFloat);
-    }
-    auto dummy_weight = torch::empty({1}, x_fp32.options());
+    TORCH_CHECK(!has_weights || weights.scalar_type() == torch::kHalf,
+                "weights must be float16");
+    auto dummy_weight = torch::empty({1}, x.options());
 
-    auto output = torch::empty({x.size(0) * top_k, x.size(1)}, x_fp32.options());
+    auto output = torch::empty({x.size(0) * top_k, x.size(1)}, x.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     gather_kernel<<<dim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
+        (half *)x.data_ptr(),
         idx_i64.data_ptr<int64_t>(),
-        has_weights ? w_fp32.data_ptr<float>() : dummy_weight.data_ptr<float>(),
-        output.data_ptr<float>(),
-        x_fp32.size(0),
-        x_fp32.size(1),
+        has_weights ? (half *)weights_half.data_ptr()
+                    : (half *)dummy_weight.data_ptr(),
+        (half *)output.data_ptr(),
+        x.size(0),
+        x.size(1),
         idx_i64.numel(),
         top_k,
         has_weights);

@@ -5,8 +5,8 @@
 #define CHUNK_SIZE 4096
 
 __mlu_entry__ void matrix_scalar_multiplication_kernel(
-    float *input,
-    float *output,
+    half *input,
+    half *output,
     int total,
     float scalar) {
     uint32_t core_id = taskId;
@@ -19,8 +19,8 @@ __mlu_entry__ void matrix_scalar_multiplication_kernel(
     uint32_t count = per_core +
                      (core_id < remainder ? 1 : 0);
 
-    __nram__ float nram_input[CHUNK_SIZE];
-    __nram__ float nram_output[CHUNK_SIZE];
+    __nram__ half nram_input[CHUNK_SIZE];
+    __nram__ half nram_output[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len =
@@ -32,46 +32,38 @@ __mlu_entry__ void matrix_scalar_multiplication_kernel(
         __memcpy(
             nram_input,
             input + start + offset,
-            len * sizeof(float),
+            len * sizeof(half),
             GDRAM2NRAM);
 
         __bang_mul_scalar(
             nram_output,
             nram_input,
-            scalar,
+            (half)scalar,
             aligned_len);
 
         __memcpy(
             output + start + offset,
             nram_output,
-            len * sizeof(float),
+            len * sizeof(half),
             NRAM2GDRAM);
     }
 }
 
 torch::Tensor bang_func(torch::Tensor A, double s) {
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(A.scalar_type() == torch::kHalf, "A must be float16");
 
-    auto original_dtype = A.scalar_type();
-    torch::Tensor input_fp32 = A;
-    if (original_dtype != torch::kFloat) {
-        input_fp32 = A.to(torch::kFloat);
-    }
-
-    auto output_fp32 = torch::empty_like(input_fp32);
+    auto output = torch::empty_like(A);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     matrix_scalar_multiplication_kernel<<<dim, ktype, queue>>>(
-        input_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        input_fp32.numel(),
+        (half *)A.data_ptr(),
+        (half *)output.data_ptr(),
+        A.numel(),
         static_cast<float>(s));
 
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
-    }
-    return output_fp32;
+    return output;
 }

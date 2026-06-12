@@ -1,12 +1,26 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "bangc_scalar.h"
+#include <stdint.h>
+
+#ifndef AICS_BANGC_SCALAR_HELPERS
+#define AICS_BANGC_SCALAR_HELPERS
+
+__nram__ float scalar_f_buffer[1];
+
+__mlu_func__ float scalar_log(float value) {
+    scalar_f_buffer[0] = value;
+    __bang_log2(scalar_f_buffer, scalar_f_buffer, 1);
+    __bang_mul_scalar(scalar_f_buffer, scalar_f_buffer, 0.6931471805599453f, 1);
+    return scalar_f_buffer[0];
+}
+
+#endif
 
 __mlu_entry__ void kl_divergence_loss_kernel(
-    float *input_log_prob,
-    float *target_prob,
-    float *output,
+    half *input_log_prob,
+    half *target_prob,
+    half *output,
     int batch,
     int total) {
     if (taskId != 0) {
@@ -15,12 +29,13 @@ __mlu_entry__ void kl_divergence_loss_kernel(
 
     float sum = 0.0f;
     for (int i = 0; i < total; ++i) {
-        float target = load_float(target_prob + i);
+        float target = (float)__load_gdram(target_prob + i);
         if (target > 0.0f) {
-            sum += target * (scalar_log(target) - load_float(input_log_prob + i));
+            sum += target * (scalar_log(target) -
+                             (float)__load_gdram(input_log_prob + i));
         }
     }
-    store_float(output, sum / (float)batch);
+    __store_gdram(output, (half)(sum / (float)batch));
 }
 
 torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
@@ -28,23 +43,20 @@ torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob)
     TORCH_CHECK(target_prob.is_contiguous(), "target_prob must be contiguous");
     TORCH_CHECK(input_log_prob.numel() == target_prob.numel(), "input sizes must match");
     TORCH_CHECK(input_log_prob.dim() >= 1, "input_log_prob must have a batch dimension");
+    TORCH_CHECK(input_log_prob.scalar_type() == torch::kHalf &&
+                    target_prob.scalar_type() == torch::kHalf,
+                "input_log_prob and target_prob must be float16");
 
-    torch::Tensor input_fp32 = input_log_prob.scalar_type() == torch::kFloat
-                                   ? input_log_prob
-                                   : input_log_prob.to(torch::kFloat);
-    torch::Tensor target_fp32 = target_prob.scalar_type() == torch::kFloat
-                                    ? target_prob
-                                    : target_prob.to(torch::kFloat);
-    auto output = torch::empty({}, input_fp32.options());
+    auto output = torch::empty({}, input_log_prob.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {1, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     kl_divergence_loss_kernel<<<dim, ktype, queue>>>(
-        input_fp32.data_ptr<float>(),
-        target_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
-        input_fp32.size(0),
-        input_fp32.numel());
+        (half *)input_log_prob.data_ptr(),
+        (half *)target_prob.data_ptr(),
+        (half *)output.data_ptr(),
+        input_log_prob.size(0),
+        input_log_prob.numel());
     return output;
 }

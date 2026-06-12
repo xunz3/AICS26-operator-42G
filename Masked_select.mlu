@@ -1,11 +1,23 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "bangc_scalar.h"
+#include <stdint.h>
+
+#ifndef AICS_BANGC_SCALAR_HELPERS
+#define AICS_BANGC_SCALAR_HELPERS
+
+__nram__ int64_t scalar_i64_buffer[1];
+
+__mlu_func__ void store_int64(int64_t *ptr, int64_t value) {
+    scalar_i64_buffer[0] = value;
+    __memcpy(ptr, scalar_i64_buffer, sizeof(int64_t), NRAM2GDRAM);
+}
+
+#endif
 
 __mlu_entry__ void masked_select_kernel(
-    float *input,
-    float *output,
+    half *input,
+    half *output,
     int64_t *count,
     int total,
     float threshold) {
@@ -15,9 +27,9 @@ __mlu_entry__ void masked_select_kernel(
 
     int64_t out_pos = 0;
     for (int i = 0; i < total; ++i) {
-        float value = load_float(input + i);
+        float value = (float)__load_gdram(input + i);
         if (value > threshold) {
-            store_float(output + out_pos, value);
+            __store_gdram(output + out_pos, (half)value);
             ++out_pos;
         }
     }
@@ -26,21 +38,19 @@ __mlu_entry__ void masked_select_kernel(
 
 torch::Tensor bang_func(torch::Tensor input, double threshold) {
     TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input.scalar_type() == torch::kHalf, "input must be float16");
 
-    torch::Tensor input_fp32 = input.scalar_type() == torch::kFloat
-                                   ? input
-                                   : input.to(torch::kFloat);
-    auto output = torch::empty({input_fp32.numel()}, input_fp32.options());
+    auto output = torch::empty({input.numel()}, input.options());
     auto count = torch::empty({1}, input.options().dtype(torch::kLong));
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {1, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     masked_select_kernel<<<dim, ktype, queue>>>(
-        input_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
+        (half *)input.data_ptr(),
+        (half *)output.data_ptr(),
         count.data_ptr<int64_t>(),
-        input_fp32.numel(),
+        input.numel(),
         static_cast<float>(threshold));
 
     auto count_cpu = count.to(torch::kCPU);

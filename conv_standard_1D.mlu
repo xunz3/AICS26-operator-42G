@@ -1,13 +1,13 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "bangc_scalar.h"
+#include <stdint.h>
 
 __mlu_entry__ void conv_standard_1d_kernel(
-    float *x,
-    float *weight,
-    float *bias,
-    float *output,
+    half *x,
+    half *weight,
+    half *bias,
+    half *output,
     int batch,
     int in_channels,
     int length,
@@ -31,19 +31,19 @@ __mlu_entry__ void conv_standard_1d_kernel(
         int b = idx / (out_channels * out_length);
         int group = oc / out_per_group;
         int ic_start = group * in_per_group;
-        float sum = has_bias ? load_float(bias + oc) : 0.0f;
+        float sum = has_bias ? (float)__load_gdram(bias + oc) : 0.0f;
 
         for (int icg = 0; icg < in_per_group; ++icg) {
             int ic = ic_start + icg;
             for (int k = 0; k < kernel_size; ++k) {
                 int il = ol * stride - padding + k * dilation;
                 if (il >= 0 && il < length) {
-                    sum += load_float(x + (b * in_channels + ic) * length + il) *
-                           load_float(weight + (oc * in_per_group + icg) * kernel_size + k);
+                    sum += (float)__load_gdram(x + (b * in_channels + ic) * length + il) *
+                           (float)__load_gdram(weight + (oc * in_per_group + icg) * kernel_size + k);
                 }
             }
         }
-        store_float(output + idx, sum);
+        __store_gdram(output + idx, (half)sum);
     }
 }
 
@@ -58,32 +58,32 @@ torch::Tensor bang_func(
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
     TORCH_CHECK(x.dim() == 3 && weight.dim() == 3, "invalid conv1d shapes");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf && weight.scalar_type() == torch::kHalf,
+                "x and weight must be float16");
 
-    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
-    torch::Tensor w_fp32 = weight.scalar_type() == torch::kFloat ? weight : weight.to(torch::kFloat);
-    torch::Tensor b_fp32 = bias;
+    torch::Tensor bias_half = bias;
     int has_bias = bias.defined() && bias.numel() > 0;
-    if (has_bias && bias.scalar_type() != torch::kFloat) {
-        b_fp32 = bias.to(torch::kFloat);
-    }
-    auto dummy_bias = torch::empty({1}, x_fp32.options());
+    TORCH_CHECK(!has_bias || bias.scalar_type() == torch::kHalf,
+                "bias must be float16");
+    auto dummy_bias = torch::empty({1}, x.options());
 
     int64_t out_length = (x.size(2) + 2 * padding - dilation * (weight.size(2) - 1) - 1) / stride + 1;
-    auto output = torch::empty({x.size(0), weight.size(0), out_length}, x_fp32.options());
+    auto output = torch::empty({x.size(0), weight.size(0), out_length}, x.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     conv_standard_1d_kernel<<<dim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        w_fp32.data_ptr<float>(),
-        has_bias ? b_fp32.data_ptr<float>() : dummy_bias.data_ptr<float>(),
-        output.data_ptr<float>(),
-        x_fp32.size(0),
-        x_fp32.size(1),
-        x_fp32.size(2),
-        w_fp32.size(0),
-        w_fp32.size(2),
+        (half *)x.data_ptr(),
+        (half *)weight.data_ptr(),
+        has_bias ? (half *)bias_half.data_ptr()
+                 : (half *)dummy_bias.data_ptr(),
+        (half *)output.data_ptr(),
+        x.size(0),
+        x.size(1),
+        x.size(2),
+        weight.size(0),
+        weight.size(2),
         out_length,
         stride,
         padding,

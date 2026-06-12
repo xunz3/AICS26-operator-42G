@@ -1,45 +1,63 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "bangc_scalar.h"
+#include <stdint.h>
+
+#define MSE_CHUNK_SIZE 1024
 
 __mlu_entry__ void mse_loss_kernel(
-    float *predictions,
-    float *targets,
-    float *output,
+    half *predictions,
+    half *targets,
+    half *output,
     int total) {
     if (taskId != 0) {
         return;
     }
 
+    __nram__ half nram_pred[MSE_CHUNK_SIZE];
+    __nram__ half nram_target[MSE_CHUNK_SIZE];
+    __nram__ float nram_pred_f[MSE_CHUNK_SIZE];
+    __nram__ float nram_target_f[MSE_CHUNK_SIZE];
+    __nram__ float nram_diff[MSE_CHUNK_SIZE];
+
     float sum = 0.0f;
-    for (int i = 0; i < total; ++i) {
-        float diff = load_float(predictions + i) - load_float(targets + i);
+    int offset = 0;
+    for (; offset + MSE_CHUNK_SIZE <= total; offset += MSE_CHUNK_SIZE) {
+        __memcpy(nram_pred, predictions + offset,
+                 MSE_CHUNK_SIZE * sizeof(half), GDRAM2NRAM);
+        __memcpy(nram_target, targets + offset,
+                 MSE_CHUNK_SIZE * sizeof(half), GDRAM2NRAM);
+        __bang_half2float(nram_pred_f, nram_pred, MSE_CHUNK_SIZE);
+        __bang_half2float(nram_target_f, nram_target, MSE_CHUNK_SIZE);
+        __bang_sub(nram_diff, nram_pred_f, nram_target_f, MSE_CHUNK_SIZE);
+        __bang_square(nram_diff, nram_diff, MSE_CHUNK_SIZE);
+        sum += __bang_sum(nram_diff, MSE_CHUNK_SIZE);
+    }
+    for (; offset < total; ++offset) {
+        float diff = (float)__load_gdram(predictions + offset) -
+                     (float)__load_gdram(targets + offset);
         sum += diff * diff;
     }
-    store_float(output, sum / (float)total);
+    __store_gdram(output, (half)(sum / (float)total));
 }
 
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
     TORCH_CHECK(predictions.is_contiguous(), "predictions must be contiguous");
     TORCH_CHECK(targets.is_contiguous(), "targets must be contiguous");
     TORCH_CHECK(predictions.numel() == targets.numel(), "input sizes must match");
+    TORCH_CHECK(predictions.scalar_type() == torch::kHalf &&
+                    targets.scalar_type() == torch::kHalf,
+                "predictions and targets must be float16");
 
-    torch::Tensor pred_fp32 = predictions.scalar_type() == torch::kFloat
-                                  ? predictions
-                                  : predictions.to(torch::kFloat);
-    torch::Tensor target_fp32 = targets.scalar_type() == torch::kFloat
-                                    ? targets
-                                    : targets.to(torch::kFloat);
-    auto output = torch::empty({}, pred_fp32.options());
+    auto output = torch::empty({}, predictions.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {1, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     mse_loss_kernel<<<dim, ktype, queue>>>(
-        pred_fp32.data_ptr<float>(),
-        target_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
-        pred_fp32.numel());
+        (half *)predictions.data_ptr(),
+        (half *)targets.data_ptr(),
+        (half *)output.data_ptr(),
+        predictions.numel());
     return output;
 }

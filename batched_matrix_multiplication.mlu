@@ -1,12 +1,14 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "bangc_scalar.h"
+#include <stdint.h>
+
+#define BMM_CHUNK_SIZE 1024
 
 __mlu_entry__ void batched_matrix_multiplication_kernel(
-    float *A,
-    float *B,
-    float *output,
+    half *A,
+    half *B,
+    half *output,
     int batch,
     int M,
     int K,
@@ -14,17 +16,34 @@ __mlu_entry__ void batched_matrix_multiplication_kernel(
     int total = batch * M * N;
     int core_id = taskId;
     int core_num = taskDim;
+    __nram__ half nram_a[BMM_CHUNK_SIZE];
+    __nram__ half nram_b[BMM_CHUNK_SIZE];
+    __nram__ float nram_a_f[BMM_CHUNK_SIZE];
+    __nram__ float nram_b_f[BMM_CHUNK_SIZE];
+    __nram__ float nram_prod[BMM_CHUNK_SIZE];
 
     for (int idx = core_id; idx < total; idx += core_num) {
         int n = idx % N;
         int m = (idx / N) % M;
         int b = idx / (M * N);
         float sum = 0.0f;
-        for (int k = 0; k < K; ++k) {
-            sum += load_float(A + (b * M + m) * K + k) *
-                   load_float(B + (b * K + k) * N + n);
+        int k = 0;
+        for (; k + BMM_CHUNK_SIZE <= K; k += BMM_CHUNK_SIZE) {
+            __memcpy(nram_a, A + (b * M + m) * K + k,
+                     BMM_CHUNK_SIZE * sizeof(half), GDRAM2NRAM);
+            for (int kk = 0; kk < BMM_CHUNK_SIZE; ++kk) {
+                nram_b[kk] = __load_gdram(B + (b * K + k + kk) * N + n);
+            }
+            __bang_half2float(nram_a_f, nram_a, BMM_CHUNK_SIZE);
+            __bang_half2float(nram_b_f, nram_b, BMM_CHUNK_SIZE);
+            __bang_mul(nram_prod, nram_a_f, nram_b_f, BMM_CHUNK_SIZE);
+            sum += __bang_sum(nram_prod, BMM_CHUNK_SIZE);
         }
-        store_float(output + idx, sum);
+        for (; k < K; ++k) {
+            sum += (float)__load_gdram(A + (b * M + m) * K + k) *
+                   (float)__load_gdram(B + (b * K + k) * N + n);
+        }
+        __store_gdram(output + idx, (half)sum);
     }
 }
 
@@ -33,21 +52,21 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 3 && B.dim() == 3, "A and B must be 3D tensors");
     TORCH_CHECK(A.size(0) == B.size(0) && A.size(2) == B.size(1), "BMM shape mismatch");
+    TORCH_CHECK(A.scalar_type() == torch::kHalf && B.scalar_type() == torch::kHalf,
+                "A and B must be float16");
 
-    torch::Tensor A_fp32 = A.scalar_type() == torch::kFloat ? A : A.to(torch::kFloat);
-    torch::Tensor B_fp32 = B.scalar_type() == torch::kFloat ? B : B.to(torch::kFloat);
-    auto output = torch::empty({A.size(0), A.size(1), B.size(2)}, A_fp32.options());
+    auto output = torch::empty({A.size(0), A.size(1), B.size(2)}, A.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     batched_matrix_multiplication_kernel<<<dim, ktype, queue>>>(
-        A_fp32.data_ptr<float>(),
-        B_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
-        A_fp32.size(0),
-        A_fp32.size(1),
-        A_fp32.size(2),
-        B_fp32.size(2));
+        (half *)A.data_ptr(),
+        (half *)B.data_ptr(),
+        (half *)output.data_ptr(),
+        A.size(0),
+        A.size(1),
+        A.size(2),
+        B.size(2));
     return output;
 }
