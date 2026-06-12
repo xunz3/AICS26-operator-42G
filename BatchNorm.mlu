@@ -17,29 +17,23 @@ __mlu_func__ float scalar_sqrt(float value) {
 #endif
 
 __mlu_entry__ void batchnorm_kernel(
-    half *x,
-    half *output,
+    float *x,
+    float *output,
     int batch,
     int channels,
     int height,
     int width,
     float eps) {
-    int total = batch * channels * height * width;
     int core_id = taskId;
     int core_num = taskDim;
     int reduce_size = batch * height * width;
 
-    for (int idx = core_id; idx < total; idx += core_num) {
-        int w = idx % width;
-        int h = (idx / width) % height;
-        int c = (idx / (width * height)) % channels;
-        int b = idx / (channels * height * width);
-
+    for (int c = core_id; c < channels; c += core_num) {
         float mean = 0.0f;
         for (int rb = 0; rb < batch; ++rb) {
             for (int rh = 0; rh < height; ++rh) {
                 for (int rw = 0; rw < width; ++rw) {
-                    mean += (float)__load_gdram(x + ((rb * channels + c) * height + rh) * width + rw);
+                    mean += __load_gdram(x + ((rb * channels + c) * height + rh) * width + rw);
                 }
             }
         }
@@ -50,17 +44,23 @@ __mlu_entry__ void batchnorm_kernel(
             for (int rh = 0; rh < height; ++rh) {
                 for (int rw = 0; rw < width; ++rw) {
                     float value =
-                        (float)__load_gdram(x + ((rb * channels + c) * height + rh) * width + rw) -
+                        __load_gdram(x + ((rb * channels + c) * height + rh) * width + rw) -
                         mean;
                     var += value * value;
                 }
             }
         }
         var /= (float)reduce_size;
-        __store_gdram(output + idx,
-                      (half)(((float)__load_gdram(x + ((b * channels + c) * height + h) * width + w) -
-                              mean) /
-                             scalar_sqrt(var + eps)));
+        float inv_std = 1.0f / scalar_sqrt(var + eps);
+        for (int b = 0; b < batch; ++b) {
+            for (int h = 0; h < height; ++h) {
+                for (int w = 0; w < width; ++w) {
+                    int offset = ((b * channels + c) * height + h) * width + w;
+                    __store_gdram(output + offset,
+                                  (__load_gdram(x + offset) - mean) * inv_std);
+                }
+            }
+        }
     }
 }
 
@@ -68,20 +68,19 @@ torch::Tensor bang_func(torch::Tensor x, int num_features) {
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(x.dim() == 4, "BatchNorm expects a 4D tensor");
     TORCH_CHECK(x.size(1) == num_features, "num_features must match channel dimension");
-    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
-
-    auto output = torch::empty_like(x);
+    torch::Tensor x_fp32 = x.scalar_type() == torch::kFloat ? x : x.to(torch::kFloat);
+    auto output = torch::empty_like(x_fp32);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     batchnorm_kernel<<<dim, ktype, queue>>>(
-        (half *)x.data_ptr(),
-        (half *)output.data_ptr(),
-        x.size(0),
-        x.size(1),
-        x.size(2),
-        x.size(3),
+        x_fp32.data_ptr<float>(),
+        output.data_ptr<float>(),
+        x_fp32.size(0),
+        x_fp32.size(1),
+        x_fp32.size(2),
+        x_fp32.size(3),
         1e-5f);
     return output;
 }

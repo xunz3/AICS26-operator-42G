@@ -50,25 +50,32 @@ __mlu_entry__ void conv_standard_1d_kernel(
 torch::Tensor bang_func(
     torch::Tensor x,
     torch::Tensor weight,
-    torch::Tensor bias,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
     int stride,
     int padding,
     int dilation,
-    int groups) {
+    int groups,
+    int has_bias) {
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
     TORCH_CHECK(x.dim() == 3 && weight.dim() == 3, "invalid conv1d shapes");
     TORCH_CHECK(x.scalar_type() == torch::kHalf && weight.scalar_type() == torch::kHalf,
                 "x and weight must be float16");
+    (void)in_channels;
+    (void)out_channels;
+    (void)kernel_size;
+    (void)has_bias;
 
-    torch::Tensor bias_half = bias;
-    int has_bias = bias.defined() && bias.numel() > 0;
-    TORCH_CHECK(!has_bias || bias.scalar_type() == torch::kHalf,
-                "bias must be float16");
     auto dummy_bias = torch::empty({1}, x.options());
 
-    int64_t out_length = (x.size(2) + 2 * padding - dilation * (weight.size(2) - 1) - 1) / stride + 1;
-    auto output = torch::empty({x.size(0), weight.size(0), out_length}, x.options());
+    int actual_in_channels = x.size(1);
+    int actual_out_channels = weight.size(0);
+    int actual_kernel_size = weight.size(2);
+    int64_t out_length =
+        (x.size(2) + 2 * padding - dilation * (actual_kernel_size - 1) - 1) / stride + 1;
+    auto output = torch::empty({x.size(0), actual_out_channels, out_length}, x.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
@@ -76,19 +83,18 @@ torch::Tensor bang_func(
     conv_standard_1d_kernel<<<dim, ktype, queue>>>(
         (half *)x.data_ptr(),
         (half *)weight.data_ptr(),
-        has_bias ? (half *)bias_half.data_ptr()
-                 : (half *)dummy_bias.data_ptr(),
+        (half *)dummy_bias.data_ptr(),
         (half *)output.data_ptr(),
         x.size(0),
-        x.size(1),
+        actual_in_channels,
         x.size(2),
-        weight.size(0),
-        weight.size(2),
+        actual_out_channels,
+        actual_kernel_size,
         out_length,
         stride,
         padding,
         dilation,
         groups,
-        has_bias);
+        0);
     return output;
 }

@@ -37,7 +37,9 @@ __mlu_entry__ void batched_matrix_multiplication_kernel(
             __bang_half2float(nram_a_f, nram_a, BMM_CHUNK_SIZE);
             __bang_half2float(nram_b_f, nram_b, BMM_CHUNK_SIZE);
             __bang_mul(nram_prod, nram_a_f, nram_b_f, BMM_CHUNK_SIZE);
-            sum += __bang_sum(nram_prod, BMM_CHUNK_SIZE);
+            for (int kk = 0; kk < BMM_CHUNK_SIZE; ++kk) {
+                sum += nram_prod[kk];
+            }
         }
         for (; k < K; ++k) {
             sum += (float)__load_gdram(A + (b * M + m) * K + k) *

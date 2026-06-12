@@ -30,7 +30,9 @@ __mlu_entry__ void matrix_vector_multiplication_kernel(
             __bang_half2float(nram_a_f, nram_a, MATVEC_CHUNK_SIZE);
             __bang_half2float(nram_b_f, nram_b, MATVEC_CHUNK_SIZE);
             __bang_mul(nram_prod, nram_a_f, nram_b_f, MATVEC_CHUNK_SIZE);
-            sum += __bang_sum(nram_prod, MATVEC_CHUNK_SIZE);
+            for (int kk = 0; kk < MATVEC_CHUNK_SIZE; ++kk) {
+                sum += nram_prod[kk];
+            }
         }
         for (; k < K; ++k) {
             sum += (float)__load_gdram(A + row * K + k) *
@@ -48,7 +50,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.scalar_type() == torch::kHalf && B.scalar_type() == torch::kHalf,
                 "A and B must be float16");
 
-    auto output = torch::empty({A.size(0), 1}, A.options());
+    auto output = torch::empty({A.size(0)}, A.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};

@@ -75,27 +75,31 @@ __mlu_entry__ void conv_transposed_2d_square_kernel(
 torch::Tensor bang_func(
     torch::Tensor x,
     torch::Tensor weight,
-    torch::Tensor bias,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
     int stride,
     int padding,
     int output_padding,
-    int groups) {
+    int groups,
+    bool has_bias) {
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
     TORCH_CHECK(x.scalar_type() == torch::kHalf && weight.scalar_type() == torch::kHalf,
                 "x and weight must be float16");
+    (void)in_channels;
+    (void)out_channels;
+    (void)kernel_size;
+    (void)has_bias;
 
-    torch::Tensor bias_half = bias;
-    int has_bias = bias.defined() && bias.numel() > 0;
-    TORCH_CHECK(!has_bias || bias.scalar_type() == torch::kHalf,
-                "bias must be float16");
     auto dummy_bias = torch::empty({1}, x.options());
 
-    int64_t kernel_size = weight.size(2);
-    int64_t out_channels = weight.size(1) * groups;
-    int64_t h_out = (x.size(2) - 1) * stride - 2 * padding + kernel_size + output_padding;
-    int64_t w_out = (x.size(3) - 1) * stride - 2 * padding + kernel_size + output_padding;
-    auto output = torch::empty({x.size(0), out_channels, h_out, w_out}, x.options());
+    int actual_in_channels = x.size(1);
+    int actual_kernel_size = weight.size(2);
+    int actual_out_channels = weight.size(1) * groups;
+    int64_t h_out = (x.size(2) - 1) * stride - 2 * padding + actual_kernel_size + output_padding;
+    int64_t w_out = (x.size(3) - 1) * stride - 2 * padding + actual_kernel_size + output_padding;
+    auto output = torch::empty({x.size(0), actual_out_channels, h_out, w_out}, x.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {1, 1, 1};
@@ -103,20 +107,19 @@ torch::Tensor bang_func(
     conv_transposed_2d_square_kernel<<<dim, ktype, queue>>>(
         (half *)x.data_ptr(),
         (half *)weight.data_ptr(),
-        has_bias ? (half *)bias_half.data_ptr()
-                 : (half *)dummy_bias.data_ptr(),
+        (half *)dummy_bias.data_ptr(),
         (half *)output.data_ptr(),
         x.size(0),
-        x.size(1),
+        actual_in_channels,
         x.size(2),
         x.size(3),
-        out_channels,
-        kernel_size,
+        actual_out_channels,
+        actual_kernel_size,
         h_out,
         w_out,
         stride,
         padding,
         groups,
-        has_bias);
+        0);
     return output;
 }

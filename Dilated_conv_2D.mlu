@@ -13,6 +13,7 @@ __mlu_entry__ void dilated_conv_2d_kernel(
     int width,
     int out_channels,
     int kernel_size,
+    int stride,
     int dilation,
     int padding,
     int out_h,
@@ -30,12 +31,12 @@ __mlu_entry__ void dilated_conv_2d_kernel(
         float sum = 0.0f;
         for (int ic = 0; ic < in_channels; ++ic) {
             for (int kh = 0; kh < kernel_size; ++kh) {
-                int ih = oh - padding + kh * dilation;
+                int ih = oh * stride - padding + kh * dilation;
                 if (ih < 0 || ih >= height) {
                     continue;
                 }
                 for (int kw = 0; kw < kernel_size; ++kw) {
-                    int iw = ow - padding + kw * dilation;
+                    int iw = ow * stride - padding + kw * dilation;
                     if (iw < 0 || iw >= width) {
                         continue;
                     }
@@ -64,9 +65,18 @@ torch::Tensor bang_func(
     TORCH_CHECK(x.scalar_type() == torch::kHalf && kernel.scalar_type() == torch::kHalf,
                 "x and kernel must be float16");
 
-    int64_t out_h = x.size(2) + 2 * padding - dilation * (kernel_size - 1);
-    int64_t out_w = x.size(3) + 2 * padding - dilation * (kernel_size - 1);
-    auto output = torch::empty({x.size(0), out_channels, out_h, out_w}, x.options());
+    (void)in_channels;
+    (void)out_channels;
+    (void)kernel_size;
+    int stride = 1;
+    int actual_in_channels = x.size(1);
+    int actual_out_channels = kernel.size(0);
+    int actual_kernel_size = kernel.size(2);
+    int64_t out_h =
+        (x.size(2) + 2 * padding - dilation * (actual_kernel_size - 1) - 1) / stride + 1;
+    int64_t out_w =
+        (x.size(3) + 2 * padding - dilation * (actual_kernel_size - 1) - 1) / stride + 1;
+    auto output = torch::empty({x.size(0), actual_out_channels, out_h, out_w}, x.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
@@ -76,11 +86,12 @@ torch::Tensor bang_func(
         (half *)kernel.data_ptr(),
         (half *)output.data_ptr(),
         x.size(0),
-        in_channels,
+        actual_in_channels,
         x.size(2),
         x.size(3),
-        out_channels,
-        kernel_size,
+        actual_out_channels,
+        actual_kernel_size,
+        stride,
         dilation,
         padding,
         out_h,
