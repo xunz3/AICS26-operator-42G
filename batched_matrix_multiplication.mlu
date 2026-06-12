@@ -3,7 +3,7 @@
 #include <cnrt.h>
 #include <stdint.h>
 
-#define BMM_N_BLOCK 64
+#define BMM_N_BLOCK 256
 
 __mlu_entry__ void batched_matrix_multiplication_kernel(
     half *A,
@@ -18,7 +18,9 @@ __mlu_entry__ void batched_matrix_multiplication_kernel(
     int core_id = taskId;
     int core_num = taskDim;
     __nram__ half b_block[BMM_N_BLOCK];
+    __nram__ half out_block[BMM_N_BLOCK];
     __nram__ float b_float[BMM_N_BLOCK];
+    __nram__ float sum_float[BMM_N_BLOCK];
 
     for (int idx = core_id; idx < total; idx += core_num) {
         int nb = idx % n_blocks;
@@ -27,11 +29,6 @@ __mlu_entry__ void batched_matrix_multiplication_kernel(
         int n_base = nb * BMM_N_BLOCK;
         int block_len = N - n_base < BMM_N_BLOCK ? N - n_base : BMM_N_BLOCK;
         int aligned_len = (block_len + 63) & ~63;
-        float sums[BMM_N_BLOCK];
-        for (int n = 0; n < block_len; ++n) {
-            sums[n] = 0.0f;
-        }
-
         for (int k = 0; k < K; ++k) {
             float a_value = (float)__load_gdram(A + (b * M + m) * K + k);
             __memcpy(b_block,
@@ -39,13 +36,18 @@ __mlu_entry__ void batched_matrix_multiplication_kernel(
                      block_len * sizeof(half),
                      GDRAM2NRAM);
             __bang_half2float(b_float, b_block, aligned_len);
-            for (int n = 0; n < block_len; ++n) {
-                sums[n] += a_value * b_float[n];
+            if (k == 0) {
+                __bang_mul_scalar(sum_float, b_float, a_value, aligned_len);
+            } else {
+                __bang_mul_scalar(b_float, b_float, a_value, aligned_len);
+                __bang_add(sum_float, sum_float, b_float, aligned_len);
             }
         }
-        for (int n = 0; n < block_len; ++n) {
-            __store_gdram(output + (b * M + m) * N + n_base + n, (half)sums[n]);
-        }
+        __bang_float2half_rn(out_block, sum_float, aligned_len);
+        __memcpy(output + (b * M + m) * N + n_base,
+                 out_block,
+                 block_len * sizeof(half),
+                 NRAM2GDRAM);
     }
 }
 

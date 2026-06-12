@@ -17,12 +17,14 @@ __mlu_entry__ void dilated_conv_2d_kernel(
     int dilation,
     int padding,
     int out_h,
-    int out_w) {
-    int total = batch * out_channels * out_h * out_w;
+    int out_w,
+    int start_idx,
+    int work_count) {
     int core_id = taskId;
     int core_num = taskDim;
 
-    for (int idx = core_id; idx < total; idx += core_num) {
+    for (int local_idx = core_id; local_idx < work_count; local_idx += core_num) {
+        int idx = start_idx + local_idx;
         int ow = idx % out_w;
         int oh = (idx / out_w) % out_h;
         int oc = (idx / (out_w * out_h)) % out_channels;
@@ -81,20 +83,28 @@ torch::Tensor bang_func(
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {64, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-    dilated_conv_2d_kernel<<<dim, ktype, queue>>>(
-        (half *)x.data_ptr(),
-        (half *)kernel.data_ptr(),
-        (half *)output.data_ptr(),
-        x.size(0),
-        actual_in_channels,
-        x.size(2),
-        x.size(3),
-        actual_out_channels,
-        actual_kernel_size,
-        stride,
-        dilation,
-        padding,
-        out_h,
-        out_w);
+    int64_t total = output.numel();
+    const int chunk = 1024;
+    for (int64_t start = 0; start < total; start += chunk) {
+        int work_count = static_cast<int>(
+            total - start < chunk ? total - start : chunk);
+        dilated_conv_2d_kernel<<<dim, ktype, queue>>>(
+            (half *)x.data_ptr(),
+            (half *)kernel.data_ptr(),
+            (half *)output.data_ptr(),
+            x.size(0),
+            actual_in_channels,
+            x.size(2),
+            x.size(3),
+            actual_out_channels,
+            actual_kernel_size,
+            stride,
+            dilation,
+            padding,
+            out_h,
+            out_w,
+            static_cast<int>(start),
+            work_count);
+    }
     return output;
 }
